@@ -1,0 +1,28 @@
+* xgds
+X [[https://github.com/Naheel-Azawy/gmenu][Gmenu]] Desktop Switcher.
+
+** Build/install
+#+begin_src shell-script
+  make install
+#+end_src
+
+** Usage
+#+begin_src shell-script
+  xgds daemon &
+  xgds switch
+#+end_src
+
+** Custom commands
+Custom dynamic desktop switcher commands.
+Example with [[https://github.com/Naheel-Azawy/bspdd][bspdd]]:
+#+begin_src shell-script
+  export XGDS_CHANGE_CMD="bspdd"
+  export XGDS_MOVE_CMD="bspdd node-move-go"
+  export XGDS_CHANGE_NEW_CMD="bspdd new"
+  export XGDS_MOVE_NEW_CMD="bspdd new-move"
+
+  xgds switch
+#+end_src
+
+** License
+GPL-3
