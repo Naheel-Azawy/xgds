@@ -2,7 +2,10 @@ PREFIX    = /usr/local
 BINPREFIX = $(DESTDIR)$(PREFIX)/bin
 
 xgds: xgds.cpp
-	g++ -O2 -o xgds xgds.cpp -lX11 -lXext -lXrandr -Wall
+	g++ -o xgds xgds.cpp -lX11 -lXext -lXrandr -Wall
+
+clean:
+	rm -f xgds
 
 install: xgds
 	mkdir -p $(BINPREFIX)
@@ -11,5 +14,5 @@ install: xgds
 uninstall:
 	rm -f $(BINPREFIX)/xgds
 
-.PHONY: install uninstall
+.PHONY: install uninstall clean
 

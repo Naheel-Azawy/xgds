@@ -11,9 +11,13 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <spawn.h>
+#include <fcntl.h>
+#include <signal.h>
 
 #include <climits>
 #include <cerrno>
@@ -30,8 +34,7 @@
 #define NAME_UPPER "XGDS"
 
 static const char *RUNDIR  = "/tmp/" NAME;
-static const char *REQFIFO = "/tmp/" NAME "/req";
-static const char *ACKFIFO = "/tmp/" NAME "/ack";
+static const char *SOCKPATH = "/tmp/" NAME "/daemon.sock";
 static const char *GMENU   = "gmenu";
 
 // ============================================================
@@ -45,15 +48,6 @@ static void ensure_dir(const char *path) {
         fprintf(stderr, NAME ": mkdir(%s): %s\n", path, strerror(errno));
 }
 
-static void ensure_fifo(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        if (S_ISFIFO(st.st_mode)) return;
-        remove(path);
-    }
-    if (mkfifo(path, 0600) != 0)
-        fprintf(stderr, NAME ": mkfifo(%s): %s\n", path, strerror(errno));
-}
 
 static void clear_dir(const char *path) {
     DIR *dir = opendir(path);
@@ -657,13 +651,14 @@ static bool save_ppm(Display *dpy, XImage *img, const char *path) {
 }
 
 // ============================================================
-// Daemon: trigger screenshot via FIFO, save ppm
+// Daemon: trigger screenshot via Unix socket, save ppm
 // ============================================================
 
-static void daemon_send_ack(bool ok) {
-    FILE *ack = fopen(ACKFIFO, "w");
-    if (ack) { fprintf(ack, ok ? "ok\n" : "err\n"); fclose(ack); }
-    else perror(NAME ": fopen ack");
+// Send the ack reply back through the already-connected client socket.
+static void daemon_send_ack(int client_fd, bool ok) {
+    const char *msg = ok ? "ok\n" : "err\n";
+    // Best-effort write; if the client disconnected early, ignore the error.
+    (void)write(client_fd, msg, strlen(msg));
 }
 
 static int run_daemon() {
@@ -679,13 +674,37 @@ static int run_daemon() {
 
     clear_dir(RUNDIR);
     ensure_dir(RUNDIR);
-    ensure_fifo(REQFIFO);
-    ensure_fifo(ACKFIFO);
+
+    // Remove any stale socket from a previous run.
+    unlink(SOCKPATH);
+
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) { perror(NAME ": socket"); return 1; }
+
+    // Ignore SIGPIPE so that a write() to a client that has already
+    // disconnected returns EPIPE instead of killing the daemon.
+    signal(SIGPIPE, SIG_IGN);
+
+    // CLOEXEC so child processes (e.g. spawned commands) don't inherit it.
+    fcntl(srv, F_SETFD, FD_CLOEXEC);
+
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror(NAME ": bind"); close(srv); return 1;
+    }
+    chmod(SOCKPATH, 0600);
+
+    if (listen(srv, /*backlog=*/8) != 0) {
+        perror(NAME ": listen"); close(srv); return 1;
+    }
 
     std::vector<Monitor> monitors = get_monitors(dpy);
     if (monitors.empty()) {
         fprintf(stderr, NAME ": no connected monitors\n");
-        return 1;
+        close(srv); return 1;
     }
 
     printf(NAME " daemon: %zu monitor(s):\n", monitors.size());
@@ -699,22 +718,31 @@ static int run_daemon() {
     for (size_t i = 0; i < monitors.size(); ++i) {
         if (!shm_alloc(dpy, shms[i], monitors[i].w, monitors[i].h)) {
             fprintf(stderr, NAME ": shm_alloc failed for monitor %zu\n", i);
-            return 1;
+            close(srv); return 1;
         }
     }
 
-    printf(NAME " daemon: ready — listening on %s\n", REQFIFO);
+    printf(NAME " daemon: ready — listening on %s\n", SOCKPATH);
     fflush(stdout);
 
     for (;;) {
-        // Blocks until client opens the write end
-        FILE *req = fopen(REQFIFO, "r");
-        if (!req) { perror(NAME ": fopen req"); continue; }
-        fclose(req);   // contents irrelevant — trigger only
+        // accept() blocks until a client connects; each connection is
+        // one screenshot request.  No open-order race is possible because
+        // the transport is connection-oriented.
+        int client_fd = accept(srv, nullptr, nullptr);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            perror(NAME ": accept");
+            continue;
+        }
+        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
-        // Determine which monitor and desktop are currently focused
-        Atom net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP",
-                                               False);
+        // Drain the single-byte request token (content is ignored).
+        char token;
+        (void)read(client_fd, &token, 1);
+
+        // Determine which monitor and desktop are currently focused.
+        Atom net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
         Atom atype; int afmt; unsigned long nitems, after;
         unsigned char *data = nullptr;
         long desk = 0;
@@ -735,15 +763,15 @@ static int run_daemon() {
         snprintf(path, sizeof(path), "%s/%ld.ppm", RUNDIR, desk);
         bool saved = save_ppm(dpy, shms[mi].img, path);
 
-        // printf(NAME " daemon: desk=%ld mon=[%d]%s -> %s (%s)\n",
-        //        desk, mi, mon.name.c_str(), path, saved ? "ok" : "err");
-        // fflush(stdout);
-
-        daemon_send_ack(saved);
+        // Reply goes back through the same connection — no race possible.
+        daemon_send_ack(client_fd, saved);
+        close(client_fd);
     }
 
     for (size_t i = 0; i < monitors.size(); ++i)
         shm_free(dpy, shms[i]);
+    close(srv);
+    unlink(SOCKPATH);
     XCloseDisplay(dpy);
     return 0;
 }
@@ -752,12 +780,19 @@ static int run_daemon() {
 // Client helpers
 // ============================================================
 
-// Check whether the daemon is up by seeing if the FIFOs exist and are
-// actually FIFOs.  This does NOT open them, so it never blocks.
+// Check whether the daemon is up by attempting a real connection to its
+// Unix socket.  Using connect() rather than stat() catches stale socket
+// files left by a crashed daemon.
 static bool daemon_running() {
-    struct stat st;
-    return stat(REQFIFO, &st) == 0 && S_ISFIFO(st.st_mode) &&
-           stat(ACKFIFO, &st) == 0 && S_ISFIFO(st.st_mode);
+    // Probe by actually connecting — avoids stale socket files.
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
+    bool ok = (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    close(fd);
+    return ok;
 }
 
 // Require the daemon; print a helpful message and return false if absent.
@@ -767,19 +802,36 @@ static bool require_daemon() {
     return false;
 }
 
-// Trigger a screenshot and block until the daemon acknowledges it.
+// Send a screenshot request to the daemon over the Unix socket and wait for
+// the "ok" / "err" reply.  Each call is a fully independent connection, so
+// there is no open-order race and concurrent callers never steal each other's
+// acknowledgement.
 static bool client_screenshot() {
-    FILE *req = fopen(REQFIFO, "w");
-    if (!req) { perror(NAME ": fopen req"); return false; }
-    fclose(req);   // opening the write end is the trigger; content is irrelevant
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror(NAME ": socket"); return false; }
 
-    FILE *ack = fopen(ACKFIFO, "r");
-    if (!ack) { perror(NAME ": fopen ack"); return false; }
-    char line[16] = {};
-    bool ok = (fgets(line, sizeof(line), ack) != nullptr)
-              && (strncmp(line, "ok", 2) == 0);
-    fclose(ack);
-    return ok;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror(NAME ": connect");
+        close(fd);
+        return false;
+    }
+
+    // Send the single-byte request token.
+    if (write(fd, "s", 1) != 1) {
+        perror(NAME ": write");
+        close(fd);
+        return false;
+    }
+
+    // Block until the daemon replies "ok\n" or "err\n".
+    char buf[4] = {};
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, MSG_WAITALL);
+    close(fd);
+    return (n >= 2 && strncmp(buf, "ok", 2) == 0);
 }
 
 // public subcommand wrapping client_screenshot()
