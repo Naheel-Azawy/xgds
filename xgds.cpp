@@ -130,18 +130,44 @@ static bool spawn_cmd(std::vector<std::string>& parts,
 }
 
 // ============================================================
+// X11 atoms — cached once per Display
+// ============================================================
+
+struct Atoms {
+    Atom net_number_of_desktops;
+    Atom net_current_desktop;
+    Atom net_desktop_names;
+    Atom net_desktop_viewport;
+    Atom net_client_list;
+    Atom net_wm_desktop;
+    Atom net_wm_name;
+    Atom net_active_window;
+    Atom utf8_string;
+};
+
+static Atoms init_atoms(Display* dpy) {
+    Atoms a;
+    a.net_number_of_desktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+    a.net_current_desktop    = XInternAtom(dpy, "_NET_CURRENT_DESKTOP",    False);
+    a.net_desktop_names      = XInternAtom(dpy, "_NET_DESKTOP_NAMES",      False);
+    a.net_desktop_viewport   = XInternAtom(dpy, "_NET_DESKTOP_VIEWPORT",   False);
+    a.net_client_list        = XInternAtom(dpy, "_NET_CLIENT_LIST",        False);
+    a.net_wm_desktop         = XInternAtom(dpy, "_NET_WM_DESKTOP",         False);
+    a.net_wm_name            = XInternAtom(dpy, "_NET_WM_NAME",            False);
+    a.net_active_window      = XInternAtom(dpy, "_NET_ACTIVE_WINDOW",      False);
+    a.utf8_string            = XInternAtom(dpy, "UTF8_STRING",             False);
+    return a;
+}
+
+// ============================================================
 // X11 helpers
 // ============================================================
 
-static std::map<long, std::string> getDesktopNames(Display* dpy) {
+static std::map<long, std::string> getDesktopNames(Display* dpy, const Atoms& atoms) {
     std::map<long, std::string> out;
     if (!dpy) return out;
 
     Window root = DefaultRootWindow(dpy);
-
-    Atom net_number_of_desktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
-    Atom net_desktop_names      = XInternAtom(dpy, "_NET_DESKTOP_NAMES",      False);
-    Atom utf8_string            = XInternAtom(dpy, "UTF8_STRING",             False);
 
     // Get number of desktops
     long num_desktops = 0;
@@ -153,9 +179,7 @@ static std::map<long, std::string> getDesktopNames(Display* dpy) {
         unsigned long bytesAfter;
         unsigned char* data = nullptr;
 
-        Atom prop = net_number_of_desktops;
-
-        if (XGetWindowProperty(dpy, root, prop,
+        if (XGetWindowProperty(dpy, root, atoms.net_number_of_desktops,
                                0, 1,
                                False,
                                XA_CARDINAL,
@@ -182,10 +206,10 @@ static std::map<long, std::string> getDesktopNames(Display* dpy) {
 
     std::string names_blob;
 
-    if (XGetWindowProperty(dpy, root, net_desktop_names,
+    if (XGetWindowProperty(dpy, root, atoms.net_desktop_names,
                            0, (~0L),
                            False,
-                           utf8_string,
+                           atoms.utf8_string,
                            &actualType,
                            &actualFormat,
                            &nItems,
@@ -222,18 +246,17 @@ static std::map<long, std::string> getDesktopNames(Display* dpy) {
     return out;
 }
 
-static int getCurrentDesktopIndex(Display* dpy) {
+static int getCurrentDesktopIndex(Display* dpy, const Atoms& atoms) {
     if (!dpy) return -1;
 
     Window root = DefaultRootWindow(dpy);
 
-    Atom prop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
     Atom type;
     int format;
     unsigned long nitems, bytesAfter;
     unsigned char* data = nullptr;
 
-    if (XGetWindowProperty(dpy, root, prop,
+    if (XGetWindowProperty(dpy, root, atoms.net_current_desktop,
                            0, 1, False, XA_CARDINAL,
                            &type, &format, &nitems,
                            &bytesAfter, &data) != Success || !data)
@@ -244,15 +267,15 @@ static int getCurrentDesktopIndex(Display* dpy) {
     return index;
 }
 
-static std::string getWindowTitle(Display* dpy, Window w, Atom netWmName, Atom utf8) {
+static std::string getWindowTitle(Display* dpy, Window w, const Atoms& atoms) {
     Atom actualType;
     int actualFormat;
     unsigned long nItems, bytesAfter;
     unsigned char* prop = nullptr;
 
     // _NET_WM_NAME (UTF-8)
-    if (XGetWindowProperty(dpy, w, netWmName,
-                           0, (~0L), False, utf8,
+    if (XGetWindowProperty(dpy, w, atoms.net_wm_name,
+                           0, (~0L), False, atoms.utf8_string,
                            &actualType, &actualFormat,
                            &nItems, &bytesAfter,
                            &prop) == Success && prop) {
@@ -297,17 +320,11 @@ static std::string getWindowTitle(Display* dpy, Window w, Atom netWmName, Atom u
 7: wm-msg - emacs - tmux 113:2384343, zsh - tmux 116:2392472
 8: EWMH Desktop Names Mapping - Brave
 */
-std::vector<std::string> getDesktopWindowTitles(Display* dpy) {
+std::vector<std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms) {
     std::vector<std::string> result;
     if (!dpy) return result;
 
     Window root = DefaultRootWindow(dpy);
-
-    Atom netNumberOfDesktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
-    Atom netClientList       = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
-    Atom netWmDesktop        = XInternAtom(dpy, "_NET_WM_DESKTOP", False);
-    Atom netWmName           = XInternAtom(dpy, "_NET_WM_NAME", False);
-    Atom utf8                = XInternAtom(dpy, "UTF8_STRING", False);
 
     Atom actualType;
     int actualFormat;
@@ -318,7 +335,7 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy) {
     {
         unsigned char* prop = nullptr;
 
-        if (XGetWindowProperty(dpy, root, netNumberOfDesktops,
+        if (XGetWindowProperty(dpy, root, atoms.net_number_of_desktops,
                                0, 1, False, XA_CARDINAL,
                                &actualType, &actualFormat,
                                &nItems, &bytesAfter,
@@ -336,7 +353,7 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy) {
     Window* clients = nullptr;
     unsigned long clientCount = 0;
 
-    if (XGetWindowProperty(dpy, root, netClientList,
+    if (XGetWindowProperty(dpy, root, atoms.net_client_list,
                            0, (~0L), False, XA_WINDOW,
                            &actualType, &actualFormat,
                            &clientCount, &bytesAfter,
@@ -351,7 +368,7 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy) {
         unsigned char* deskProp = nullptr;
         unsigned long desk = 0xFFFFFFFF;
 
-        if (XGetWindowProperty(dpy, w, netWmDesktop,
+        if (XGetWindowProperty(dpy, w, atoms.net_wm_desktop,
                                0, 1, False, XA_CARDINAL,
                                &actualType, &actualFormat,
                                &nItems, &bytesAfter,
@@ -368,7 +385,7 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy) {
             continue; // invalid/out-of-range
         }
 
-        std::string title = getWindowTitle(dpy, w, netWmName, utf8);
+        std::string title = getWindowTitle(dpy, w, atoms);
         if (title.empty()) continue;
 
         desktops[desk].push_back(title);
@@ -392,16 +409,13 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy) {
     return result;
 }
 
-static bool switchDesktop(Display *dpy, long desktop) {
+static bool switchDesktop(Display *dpy, long desktop, const Atoms& atoms) {
     Window root = DefaultRootWindow(dpy);
-
-    Atom current =
-        XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
 
     XEvent ev{};
     ev.xclient.type = ClientMessage;
     ev.xclient.window = root;
-    ev.xclient.message_type = current;
+    ev.xclient.message_type = atoms.net_current_desktop;
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = desktop;
     ev.xclient.data.l[1] = CurrentTime;
@@ -416,11 +430,8 @@ static bool switchDesktop(Display *dpy, long desktop) {
     return true;
 }
 
-static bool moveFocusedWindowToDesktop(Display *dpy, long desktop) {
+static bool moveFocusedWindowToDesktop(Display *dpy, long desktop, const Atoms& atoms) {
     Window root = DefaultRootWindow(dpy);
-
-    Atom activeAtom =
-        XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
 
     Atom actual;
     int format;
@@ -429,7 +440,7 @@ static bool moveFocusedWindowToDesktop(Display *dpy, long desktop) {
 
     if (XGetWindowProperty(dpy,
                            root,
-                           activeAtom,
+                           atoms.net_active_window,
                            0,
                            1,
                            False,
@@ -445,13 +456,10 @@ static bool moveFocusedWindowToDesktop(Display *dpy, long desktop) {
     Window win = *(Window *)data;
     XFree(data);
 
-    Atom wmDesktop =
-        XInternAtom(dpy, "_NET_WM_DESKTOP", False);
-
     XEvent ev{};
     ev.xclient.type = ClientMessage;
     ev.xclient.window = win;
-    ev.xclient.message_type = wmDesktop;
+    ev.xclient.message_type = atoms.net_wm_desktop;
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = desktop;
     ev.xclient.data.l[1] = CurrentTime;
@@ -466,10 +474,10 @@ static bool moveFocusedWindowToDesktop(Display *dpy, long desktop) {
     return true;
 }
 
-static bool moveFocusedWindowAndSwitch(Display *dpy, long desktop) {
-    if (!moveFocusedWindowToDesktop(dpy, desktop))
+static bool moveFocusedWindowAndSwitch(Display *dpy, long desktop, const Atoms& atoms) {
+    if (!moveFocusedWindowToDesktop(dpy, desktop, atoms))
         return false;
-    return switchDesktop(dpy, desktop);
+    return switchDesktop(dpy, desktop, atoms);
 }
 
 // ============================================================
@@ -524,16 +532,15 @@ static std::vector<Monitor> get_monitors(Display *dpy) {
 // ============================================================
 
 [[maybe_unused]]
-static int focused_monitor(Display *dpy, const std::vector<Monitor> &mons) {
+static int focused_monitor(Display *dpy, const std::vector<Monitor> &mons, const Atoms& atoms) {
     if (mons.size() == 1) return 0;
 
     Window root = DefaultRootWindow(dpy);
-    Atom net_active = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", True);
-    if (net_active == None) return 0;
+    if (atoms.net_active_window == None) return 0;
 
     Atom atype; int afmt; unsigned long nitems, after;
     unsigned char *prop = nullptr;
-    if (XGetWindowProperty(dpy, root, net_active, 0, 1, False, XA_WINDOW,
+    if (XGetWindowProperty(dpy, root, atoms.net_active_window, 0, 1, False, XA_WINDOW,
                            &atype, &afmt, &nitems, &after, &prop) != Success || !prop)
         return 0;
 
@@ -710,6 +717,7 @@ static bool rebuild_monitors(Display *dpy,
 static bool capture_monitor_desktops(Display *dpy,
                                      const std::vector<Monitor> &monitors,
                                      const std::vector<ShmImage> &shms,
+                                     const Atoms& atoms,
                                      bool &saved) {
     if (monitors.empty()) {
         fprintf(stderr, NAME ": screenshot skipped — no monitors available\n");
@@ -738,17 +746,8 @@ static bool capture_monitor_desktops(Display *dpy,
         return fallback;
     };
 
-    static Atom atom_num_desktops =
-        XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
-
-    static Atom atom_current_desktop =
-        XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
-
-    static Atom atom_desktop_viewport =
-        XInternAtom(dpy, "_NET_DESKTOP_VIEWPORT", False);
-
     // Total number of desktops.
-    long num_desktops = read_cardinal(atom_num_desktops, 1);
+    long num_desktops = read_cardinal(atoms.net_number_of_desktops, 1);
 
     // For each monitor, find which desktop is currently visible on
     // it by matching the desktop's viewport origin to the monitor
@@ -758,7 +757,7 @@ static bool capture_monitor_desktops(Display *dpy,
     // Fallback: if no desktop maps to a monitor (e.g. the WM uses a
     // single shared viewport), use _NET_CURRENT_DESKTOP for every
     // monitor so we at least capture something useful.
-    long current_desk = read_cardinal(atom_current_desktop, -1);
+    long current_desk = read_cardinal(atoms.net_current_desktop, -1);
     long current_mon = -1;
     if (current_desk < 0) {
         fprintf(stderr, NAME ": screenshot skipped - current desktop not found\n");
@@ -771,7 +770,7 @@ static bool capture_monitor_desktops(Display *dpy,
     // per-monitor workspaces) the viewport origin equals the
     // monitor's top-left corner.
     std::vector<std::pair<long, long>> viewport(num_desktops, {-1, -1});
-    if (XGetWindowProperty(dpy, root, atom_desktop_viewport, 0,
+    if (XGetWindowProperty(dpy, root, atoms.net_desktop_viewport, 0,
                            num_desktops * 2, False, XA_CARDINAL,
                            &atype, &afmt, &nitems, &after, &data) == Success
         && data) {
@@ -889,6 +888,10 @@ static int run_daemon() {
         close(srv); return 1;
     }
 
+    // Cache all needed atoms once — XInternAtom round-trips are cheap
+    // but there is no reason to repeat them on every screenshot request.
+    const Atoms atoms = init_atoms(dpy);
+
     printf(NAME " daemon: ready — listening on %s\n", SOCKPATH);
     fflush(stdout);
 
@@ -958,7 +961,7 @@ static int run_daemon() {
                 bool saved = false;
 
                 if (token == 's') {
-                    saved = capture_monitor_desktops(dpy, monitors, shms, saved);
+                    saved = capture_monitor_desktops(dpy, monitors, shms, atoms, saved);
                 }
 
                 // Reply goes back through the same connection — no race possible.
@@ -1055,14 +1058,16 @@ int run_picker(bool move_mode) {
         fprintf(stderr, NAME
                 ": screenshot failed — menu may show stale thumbnails\n");
 
-    auto cmd_change     = env_cmd(NAME_UPPER "_CHANGE_CMD");     // e.g. "bspdd"
-    auto cmd_move       = env_cmd(NAME_UPPER "_MOVE_CMD");       // e.g. "bspdd node-move-go"
-    auto cmd_change_new = env_cmd(NAME_UPPER "_CHANGE_NEW_CMD"); // e.g. "bspdd new"
-    auto cmd_move_new   = env_cmd(NAME_UPPER "_MOVE_NEW_CMD");   // e.g. "bspdd new-move"
+    auto cmd_change     = env_cmd(NAME_UPPER "_CHANGE_CMD");
+    auto cmd_move       = env_cmd(NAME_UPPER "_MOVE_CMD");
+    auto cmd_change_new = env_cmd(NAME_UPPER "_CHANGE_NEW_CMD");
+    auto cmd_move_new   = env_cmd(NAME_UPPER "_MOVE_NEW_CMD");
 
-    int focused_idx = getCurrentDesktopIndex(dpy);
-    auto desks = getDesktopNames(dpy);
-    auto wins  = getDesktopWindowTitles(dpy);
+    const Atoms atoms = init_atoms(dpy);
+
+    int focused_idx = getCurrentDesktopIndex(dpy, atoms);
+    auto desks = getDesktopNames(dpy, atoms);
+    auto wins  = getDesktopWindowTitles(dpy, atoms);
 
     // Build the gmenu item list in memory (same format as before)
     std::string items;
@@ -1212,9 +1217,9 @@ int run_picker(bool move_mode) {
         }
 
         if (move_mode) {
-            moveFocusedWindowAndSwitch(dpy, choice_idx);
+            moveFocusedWindowAndSwitch(dpy, choice_idx, atoms);
         } else {
-            switchDesktop(dpy, choice_idx);
+            switchDesktop(dpy, choice_idx, atoms);
         }
     }
 
@@ -1253,8 +1258,9 @@ int main(int argc, char **argv) {
         return run_picker(true);
     } else if (!strcmp(cmd, "ls")) {
         Display* dpy = XOpenDisplay(nullptr);
-        auto desks = getDesktopNames(dpy);
-        auto wins = getDesktopWindowTitles(dpy);
+        const Atoms atoms = init_atoms(dpy);
+        auto desks = getDesktopNames(dpy, atoms);
+        auto wins = getDesktopWindowTitles(dpy, atoms);
         for (const auto &[idx, d] : desks) {
             printf("%s: %s\n", d.c_str(), wins[idx].c_str());
         }
