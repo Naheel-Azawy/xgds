@@ -661,6 +661,44 @@ static void daemon_send_ack(int client_fd, bool ok) {
     (void)write(client_fd, msg, strlen(msg));
 }
 
+// Free all SHM buffers and rebuild monitors + SHM from the current RandR state.
+// Returns false if no monitors are found after the refresh.
+static bool rebuild_monitors(Display *dpy,
+                             std::vector<Monitor>  &monitors,
+                             std::vector<ShmImage> &shms) {
+    // Release old SHM buffers.
+    for (auto &s : shms) shm_free(dpy, s);
+    shms.clear();
+    monitors.clear();
+
+    monitors = get_monitors(dpy);
+    if (monitors.empty()) {
+        fprintf(stderr, NAME ": no connected monitors after hotplug\n");
+        return false;
+    }
+
+    printf(NAME " daemon: %zu monitor(s):\n", monitors.size());
+    for (size_t i = 0; i < monitors.size(); ++i)
+        printf("  [%zu] %-12s  %dx%d+%d+%d\n",
+               i, monitors[i].name.c_str(),
+               monitors[i].w, monitors[i].h,
+               monitors[i].x, monitors[i].y);
+    fflush(stdout);
+
+    shms.resize(monitors.size());
+    for (size_t i = 0; i < monitors.size(); ++i) {
+        if (!shm_alloc(dpy, shms[i], monitors[i].w, monitors[i].h)) {
+            fprintf(stderr, NAME ": shm_alloc failed for monitor %zu\n", i);
+            // Free anything we already allocated before returning.
+            for (size_t j = 0; j < i; ++j) shm_free(dpy, shms[j]);
+            shms.clear();
+            monitors.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
 static int run_daemon() {
     Display *dpy = XOpenDisplay(nullptr);
     if (!dpy) {
@@ -670,6 +708,14 @@ static int run_daemon() {
 
     if (!XShmQueryExtension(dpy)) {
         fprintf(stderr, NAME ": XShm extension required\n"); return 1;
+    }
+
+    // Subscribe to RandR events so we learn about hotplug changes.
+    int rr_event_base, rr_error_base;
+    bool have_randr = XRRQueryExtension(dpy, &rr_event_base, &rr_error_base);
+    if (have_randr) {
+        Window root = DefaultRootWindow(dpy);
+        XRRSelectInput(dpy, root, RROutputChangeNotifyMask | RRScreenChangeNotifyMask);
     }
 
     clear_dir(RUNDIR);
@@ -688,6 +734,9 @@ static int run_daemon() {
     // CLOEXEC so child processes (e.g. spawned commands) don't inherit it.
     fcntl(srv, F_SETFD, FD_CLOEXEC);
 
+    // Non-blocking so we can interleave accept() with X11 event processing.
+    fcntl(srv, F_SETFL, fcntl(srv, F_GETFL) | O_NONBLOCK);
+
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
@@ -701,75 +750,113 @@ static int run_daemon() {
         perror(NAME ": listen"); close(srv); return 1;
     }
 
-    std::vector<Monitor> monitors = get_monitors(dpy);
-    if (monitors.empty()) {
+    std::vector<Monitor> monitors;
+    std::vector<ShmImage> shms;
+
+    if (!rebuild_monitors(dpy, monitors, shms)) {
         fprintf(stderr, NAME ": no connected monitors\n");
         close(srv); return 1;
-    }
-
-    printf(NAME " daemon: %zu monitor(s):\n", monitors.size());
-    for (size_t i = 0; i < monitors.size(); ++i)
-        printf("  [%zu] %-12s  %dx%d+%d+%d\n",
-               i, monitors[i].name.c_str(),
-               monitors[i].w, monitors[i].h,
-               monitors[i].x, monitors[i].y);
-
-    std::vector<ShmImage> shms(monitors.size());
-    for (size_t i = 0; i < monitors.size(); ++i) {
-        if (!shm_alloc(dpy, shms[i], monitors[i].w, monitors[i].h)) {
-            fprintf(stderr, NAME ": shm_alloc failed for monitor %zu\n", i);
-            close(srv); return 1;
-        }
     }
 
     printf(NAME " daemon: ready — listening on %s\n", SOCKPATH);
     fflush(stdout);
 
+    int x11_fd = ConnectionNumber(dpy);
+
     for (;;) {
-        // accept() blocks until a client connects; each connection is
-        // one screenshot request.  No open-order race is possible because
-        // the transport is connection-oriented.
-        int client_fd = accept(srv, nullptr, nullptr);
-        if (client_fd < 0) {
+        // Drain all pending X11 events (RandR hotplug notifications).
+        while (XPending(dpy)) {
+            XEvent ev;
+            XNextEvent(dpy, &ev);
+
+            if (!have_randr) continue;
+
+            // RRScreenChangeNotify: screen geometry changed (resolution/rotation).
+            if (ev.type == rr_event_base + RRScreenChangeNotify) {
+                // Update RandR's internal state before re-querying.
+                XRRUpdateConfiguration(&ev);
+                printf(NAME ": RandR screen change — rebuilding monitors\n");
+                fflush(stdout);
+                rebuild_monitors(dpy, monitors, shms);
+                continue;
+            }
+
+            // RRNotify sub-events (output connect/disconnect).
+            if (ev.type == rr_event_base + RRNotify) {
+                XRRNotifyEvent *rrev = reinterpret_cast<XRRNotifyEvent *>(&ev);
+                if (rrev->subtype == RRNotify_OutputChange) {
+                    printf(NAME ": RandR output change — rebuilding monitors\n");
+                    fflush(stdout);
+                    rebuild_monitors(dpy, monitors, shms);
+                }
+                continue;
+            }
+        }
+
+        // Wait for activity on either the Unix socket or the X11 connection.
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(srv,    &rfds);
+        FD_SET(x11_fd, &rfds);
+        int nfds = std::max(srv, x11_fd) + 1;
+
+        // No timeout — we wake up on socket activity OR X11 events.
+        int sel = select(nfds, &rfds, nullptr, nullptr, nullptr);
+        if (sel < 0) {
             if (errno == EINTR) continue;
-            perror(NAME ": accept");
+            perror(NAME ": select");
             continue;
         }
-        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
-        // Drain the single-byte request token (content is ignored).
-        char token;
-        (void)read(client_fd, &token, 1);
+        // Handle incoming screenshot requests.
+        if (FD_ISSET(srv, &rfds)) {
+            int client_fd = accept(srv, nullptr, nullptr);
+            if (client_fd < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    perror(NAME ": accept");
+                // else: spurious wake-up, loop back
+            } else {
+                fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
-        // Determine which monitor and desktop are currently focused.
-        Atom net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
-        Atom atype; int afmt; unsigned long nitems, after;
-        unsigned char *data = nullptr;
-        long desk = 0;
-        if (XGetWindowProperty(dpy, DefaultRootWindow(dpy),
-                               net_current_desktop, 0, 1, False, XA_CARDINAL,
-                               &atype, &afmt, &nitems,
-                               &after, &data) == Success
-            && data && nitems == 1) {
-            desk = (long)*(unsigned long *)data;
-            XFree(data);
+                // Drain the single-byte request token (content is ignored).
+                char token;
+                (void)read(client_fd, &token, 1);
+
+                bool saved = false;
+                if (!monitors.empty()) {
+                    // Determine which monitor and desktop are currently focused.
+                    Atom net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
+                    Atom atype; int afmt; unsigned long nitems, after;
+                    unsigned char *data = nullptr;
+                    long desk = 0;
+                    if (XGetWindowProperty(dpy, DefaultRootWindow(dpy),
+                                           net_current_desktop, 0, 1, False, XA_CARDINAL,
+                                           &atype, &afmt, &nitems,
+                                           &after, &data) == Success
+                        && data && nitems == 1) {
+                        desk = (long)*(unsigned long *)data;
+                        XFree(data);
+                    }
+
+                    int mi = focused_monitor(dpy, monitors);
+                    grab_monitor(dpy, monitors[mi], shms[mi]);
+
+                    char path[256];
+                    snprintf(path, sizeof(path), "%s/%ld.ppm", RUNDIR, desk);
+                    saved = save_ppm(dpy, shms[mi].img, path);
+                } else {
+                    fprintf(stderr, NAME ": screenshot skipped — no monitors available\n");
+                }
+
+                // Reply goes back through the same connection — no race possible.
+                daemon_send_ack(client_fd, saved);
+                close(client_fd);
+            }
         }
-
-        int mi = focused_monitor(dpy, monitors);
-        const Monitor &mon = monitors[mi];
-        grab_monitor(dpy, mon, shms[mi]);
-
-        char path[256];
-        snprintf(path, sizeof(path), "%s/%ld.ppm", RUNDIR, desk);
-        bool saved = save_ppm(dpy, shms[mi].img, path);
-
-        // Reply goes back through the same connection — no race possible.
-        daemon_send_ack(client_fd, saved);
-        close(client_fd);
+        // X11 activity is handled at the top of the loop via XPending().
     }
 
-    for (size_t i = 0; i < monitors.size(); ++i)
-        shm_free(dpy, shms[i]);
+    for (auto &s : shms) shm_free(dpy, s);
     close(srv);
     unlink(SOCKPATH);
     XCloseDisplay(dpy);
