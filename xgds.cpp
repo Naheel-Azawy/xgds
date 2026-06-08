@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <format>
 #include <vector>
 #include <map>
 #include <sstream>
@@ -33,10 +34,10 @@
 
 #define NAME       "xgds"
 #define NAME_UPPER "XGDS"
+#define GMENU      "gmenu"
 
-static const char *RUNDIR  = "/tmp/" NAME;
-static const char *SOCKPATH = "/tmp/" NAME "/daemon.sock";
-static const char *GMENU   = "gmenu";
+static std::string run_dir;
+static std::string sock_path;
 
 // ============================================================
 // Helpers
@@ -47,6 +48,24 @@ unsigned long millis() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static const std::string runtime_dir() {
+    // XDG_RUNTIME_DIR is guaranteed by systemd/PAM on any modern Linux
+    const char* xdg = getenv("XDG_RUNTIME_DIR");
+    if (xdg && *xdg) return std::string(xdg);
+    // Fallback for environments without systemd
+    return "/run/user/" + std::to_string(getuid());
+}
+
+static void init_paths() {
+    const auto p = runtime_dir();
+    run_dir   = p + "/" NAME;
+    sock_path = p + "/" NAME "/daemon.sock";
+}
+
+static std::string desktop_screenshot_path(long desk) {
+    return run_dir + "/" + std::to_string(desk) + ".ppm";
 }
 
 static void ensure_dir(const char *path) {
@@ -819,9 +838,8 @@ static bool capture_monitor_desktops(Display *dpy,
         long desk = ((long)mi == current_mon) ?
             current_desk : mon_desk[mi];
         grab_monitor(dpy, monitors[mi], shms[mi]);
-        char path[256];
-        snprintf(path, sizeof(path), "%s/%ld.ppm", RUNDIR, desk);
-        if (save_ppm(dpy, shms[mi].img, path))
+        std::string path = desktop_screenshot_path(desk);
+        if (save_ppm(dpy, shms[mi].img, path.c_str()))
             ++saved_count;
     }
 
@@ -848,11 +866,11 @@ static int run_daemon() {
         XRRSelectInput(dpy, root, RROutputChangeNotifyMask | RRScreenChangeNotifyMask);
     }
 
-    clear_dir(RUNDIR);
-    ensure_dir(RUNDIR);
+    clear_dir(run_dir.c_str());
+    ensure_dir(run_dir.c_str());
 
     // Remove any stale socket from a previous run.
-    unlink(SOCKPATH);
+    unlink(sock_path.c_str());
 
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) { perror(NAME ": socket"); return 1; }
@@ -869,12 +887,12 @@ static int run_daemon() {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror(NAME ": bind"); close(srv); return 1;
     }
-    chmod(SOCKPATH, 0600);
+    chmod(sock_path.c_str(), 0600);
 
     if (listen(srv, /*backlog=*/8) != 0) {
         perror(NAME ": listen"); close(srv); return 1;
@@ -892,7 +910,7 @@ static int run_daemon() {
     // but there is no reason to repeat them on every screenshot request.
     const Atoms atoms = init_atoms(dpy);
 
-    printf(NAME " daemon: ready — listening on %s\n", SOCKPATH);
+    printf(NAME " daemon: ready — listening on %s\n", sock_path.c_str());
     fflush(stdout);
 
     int x11_fd = ConnectionNumber(dpy);
@@ -974,7 +992,7 @@ static int run_daemon() {
 
     for (auto &s : shms) shm_free(dpy, s);
     close(srv);
-    unlink(SOCKPATH);
+    unlink(sock_path.c_str());
     XCloseDisplay(dpy);
     return 0;
 }
@@ -992,7 +1010,7 @@ static bool daemon_running() {
     if (fd < 0) return false;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
     bool ok = (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     close(fd);
     return ok;
@@ -1015,7 +1033,7 @@ static bool client_screenshot() {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKPATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror(NAME ": connect");
@@ -1070,23 +1088,21 @@ int run_picker(bool move_mode) {
     auto wins  = getDesktopWindowTitles(dpy, atoms);
 
     // Build the gmenu item list in memory (same format as before)
-    std::string items;
-    char entry[1024];
+    std::ostringstream oss;
     for (const auto &[idx, d] : desks) {
         if (d.empty()) continue;
-        char ppm[256];
-        snprintf(ppm, sizeof(ppm), "%s/%ld.ppm", RUNDIR, idx);
+        const std::string ppm = desktop_screenshot_path(idx);
         struct stat st;
-        const char* icon = (stat(ppm, &st) == 0) ? ppm : "desktop";
-        snprintf(entry, sizeof(entry),
-                 ">>j {\"name\":\"%s: %s\",\"icon\":\"%s\"}\n",
-                 d.c_str(), wins[idx].c_str(), icon);
-        items += entry;
+        const std::string icon =
+            (stat(ppm.c_str(), &st) == 0) ? ppm : "desktop";
+        oss << ">>j {\"name\":\"" << d << ": " << wins[idx]
+            << "\",\"icon\":\"" << icon << "\"}\n";
     }
     if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
-        items += ">>j {\"name\":\"New\","
+        oss << ">>j {\"name\":\"New\","
             "\"icon\":\"window-new-symbolic\",\"icon-size\":64}\n";
     }
+    std::string items = oss.str();
 
     // Two pipes: parent->child (stdin of gmenu) and child->parent (stdout of gmenu)
     int in_pipe[2];   // [0] child reads,  [1] parent writes
@@ -1247,6 +1263,8 @@ int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *cmd = argv[1];
+
+    init_paths();
 
     if (!strcmp(cmd, "daemon")) {
         return run_daemon();
