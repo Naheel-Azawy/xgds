@@ -11,6 +11,7 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dirent.h>
@@ -41,13 +42,19 @@ static const char *GMENU   = "gmenu";
 // Helpers
 // ============================================================
 
+[[maybe_unused]]
+unsigned long millis() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 static void ensure_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) return;
     if (mkdir(path, 0755) != 0 && errno != EEXIST)
         fprintf(stderr, NAME ": mkdir(%s): %s\n", path, strerror(errno));
 }
-
 
 static void clear_dir(const char *path) {
     DIR *dir = opendir(path);
@@ -516,6 +523,7 @@ static std::vector<Monitor> get_monitors(Display *dpy) {
 // Focused-monitor detection
 // ============================================================
 
+[[maybe_unused]]
 static int focused_monitor(Display *dpy, const std::vector<Monitor> &mons) {
     if (mons.size() == 1) return 0;
 
@@ -609,7 +617,7 @@ static void shm_free(Display *dpy, ShmImage &s) {
 // Screenshot + PPM writer
 // ============================================================
 
-static void grab_monitor(Display *dpy, const Monitor &mon, ShmImage &s) {
+static void grab_monitor(Display *dpy, const Monitor &mon, const ShmImage &s) {
     XShmGetImage(dpy, DefaultRootWindow(dpy), s.img, mon.x, mon.y, AllPlanes);
     XFlush(dpy);
 }
@@ -697,6 +705,129 @@ static bool rebuild_monitors(Display *dpy,
         }
     }
     return true;
+}
+
+static bool capture_monitor_desktops(Display *dpy,
+                                     const std::vector<Monitor> &monitors,
+                                     const std::vector<ShmImage> &shms,
+                                     bool &saved) {
+    if (monitors.empty()) {
+        fprintf(stderr, NAME ": screenshot skipped — no monitors available\n");
+        return false;
+    }
+
+    Window root = DefaultRootWindow(dpy);
+
+    Atom atype;
+    int afmt;
+    unsigned long nitems;
+    unsigned long after;
+    unsigned char *data = nullptr;
+
+    auto read_cardinal = [&](Atom atom, long fallback) -> long {
+        if (XGetWindowProperty(dpy, root, atom, 0, 1, False,
+                               XA_CARDINAL, &atype, &afmt,
+                               &nitems, &after, &data) == Success
+            && data) {
+            long value = (long)*(unsigned long *)data;
+            XFree(data);
+            data = nullptr;
+            return value;
+        }
+
+        return fallback;
+    };
+
+    static Atom atom_num_desktops =
+        XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+
+    static Atom atom_current_desktop =
+        XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
+
+    static Atom atom_desktop_viewport =
+        XInternAtom(dpy, "_NET_DESKTOP_VIEWPORT", False);
+
+    // Total number of desktops.
+    long num_desktops = read_cardinal(atom_num_desktops, 1);
+
+    // For each monitor, find which desktop is currently visible on
+    // it by matching the desktop's viewport origin to the monitor
+    // geometry.  A desktop is "on" a monitor when its viewport
+    // origin falls inside (or equals the top-left of) that monitor.
+    //
+    // Fallback: if no desktop maps to a monitor (e.g. the WM uses a
+    // single shared viewport), use _NET_CURRENT_DESKTOP for every
+    // monitor so we at least capture something useful.
+    long current_desk = read_cardinal(atom_current_desktop, -1);
+    long current_mon = -1;
+    if (current_desk < 0) {
+        fprintf(stderr, NAME ": screenshot skipped - current desktop not found\n");
+        return false;
+    }
+
+    // _NET_DESKTOP_VIEWPORT: pairs of (x,y) per desktop that tell
+    // which viewport origin each desktop is mapped to.  On WMs that
+    // assign one desktop per monitor (e.g. bspwm, Openbox with
+    // per-monitor workspaces) the viewport origin equals the
+    // monitor's top-left corner.
+    std::vector<std::pair<long, long>> viewport(num_desktops, {-1, -1});
+    if (XGetWindowProperty(dpy, root, atom_desktop_viewport, 0,
+                           num_desktops * 2, False, XA_CARDINAL,
+                           &atype, &afmt, &nitems, &after, &data) == Success
+        && data) {
+        auto *vals = (unsigned long *)data;
+        for (long d = 0;
+             d < num_desktops &&
+                 (unsigned long)(d * 2 + 1) < nitems;
+             ++d) {
+            viewport[d] = {
+                (long)vals[d * 2],
+                (long)vals[d * 2 + 1]
+            };
+        }
+        XFree(data);
+        data = nullptr;
+    }
+
+    auto monitor_for_point = [&](long x, long y) -> long {
+        for (size_t mi = 0; mi < monitors.size(); ++mi) {
+            const Monitor &m = monitors[mi];
+            if (x >= m.x && x < m.x + m.w &&
+                y >= m.y && y < m.y + m.h) {
+                return (long)mi;
+            }
+        }
+        return -1;
+    };
+
+    // Build monitor→desktop mapping.
+    std::vector<long> mon_desk(monitors.size(), -1);
+    for (long d = 0; d < num_desktops; ++d) {
+        const auto &[vx, vy] = viewport[d];
+        if (vx < 0 || vy < 0)
+            continue;
+        long mi = monitor_for_point(vx, vy);
+        if (mi < 0)
+            continue;
+        mon_desk[mi] = d;
+        if (d == current_desk)
+            current_mon = mi;
+    }
+
+    // Capture every monitor and save its PPM.
+    int saved_count = 0;
+    for (size_t mi = 0; mi < monitors.size(); ++mi) {
+        long desk = ((long)mi == current_mon) ?
+            current_desk : mon_desk[mi];
+        grab_monitor(dpy, monitors[mi], shms[mi]);
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%ld.ppm", RUNDIR, desk);
+        if (save_ppm(dpy, shms[mi].img, path))
+            ++saved_count;
+    }
+
+    saved = (saved_count > 0);
+    return saved;
 }
 
 static int run_daemon() {
@@ -820,32 +951,14 @@ static int run_daemon() {
 
                 // Drain the single-byte request token (content is ignored).
                 char token;
-                (void)read(client_fd, &token, 1);
+                if ((read(client_fd, &token, 1)) < 1) {
+                    continue;
+                }
 
                 bool saved = false;
-                if (!monitors.empty()) {
-                    // Determine which monitor and desktop are currently focused.
-                    Atom net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
-                    Atom atype; int afmt; unsigned long nitems, after;
-                    unsigned char *data = nullptr;
-                    long desk = 0;
-                    if (XGetWindowProperty(dpy, DefaultRootWindow(dpy),
-                                           net_current_desktop, 0, 1, False, XA_CARDINAL,
-                                           &atype, &afmt, &nitems,
-                                           &after, &data) == Success
-                        && data && nitems == 1) {
-                        desk = (long)*(unsigned long *)data;
-                        XFree(data);
-                    }
 
-                    int mi = focused_monitor(dpy, monitors);
-                    grab_monitor(dpy, monitors[mi], shms[mi]);
-
-                    char path[256];
-                    snprintf(path, sizeof(path), "%s/%ld.ppm", RUNDIR, desk);
-                    saved = save_ppm(dpy, shms[mi].img, path);
-                } else {
-                    fprintf(stderr, NAME ": screenshot skipped — no monitors available\n");
+                if (token == 's') {
+                    saved = capture_monitor_desktops(dpy, monitors, shms, saved);
                 }
 
                 // Reply goes back through the same connection — no race possible.
