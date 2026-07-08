@@ -2,7 +2,7 @@ PREFIX    = /usr/local
 BINPREFIX = $(DESTDIR)$(PREFIX)/bin
 
 xgds: xgds.cpp
-	g++ -o xgds xgds.cpp -lX11 -lXext -lXrandr -Wall
+	g++ -o xgds xgds.cpp -lX11 -lXext -lXrandr -Wall -Wextra
 
 clean:
 	rm -f xgds

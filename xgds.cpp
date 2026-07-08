@@ -316,113 +316,82 @@ static std::string getWindowTitle(Display* dpy, Window w, const Atoms& atoms) {
     return {};
 }
 
-/* TODO: something is wrong here
-
-21:05 3> sh foo.sh                      <----------- (CORRECT OLD SCRIPT)
-1: btop - tmux 0:1878
-2: Inbox - info@iecon2026.org - Mozilla Thunderbird
-3: c++ print map - Google Search - Brave
-4: chwsg.sh - emacs - tmux 80:2049132, zsh - tmux 126:2445806, wsp.cpp - emacs - tmux 87:2098353, foo.sh - emacs - tmux 123:2442046, chwsg.sh - emacs - tmux 124:2443368
-5: item.vala - emacs - tmux 97:2208949, zsh - tmux 111:2358834
-6: wm-msg - emacs - tmux 113:2384343, zsh - tmux 116:2392472
-7: EWMH Desktop Names Mapping - Brave
-8: 2025-10-19-tii - tmux 3:12335
-21:05 3>
-21:05 3>
-21:05 3> ./foo                      <----------- (THIS)
-1: btop - tmux 0:1878
-2: Inbox - info@iecon2026.org - Mozilla Thunderbird
-3: c++ print map - Google Search - Brave
-4: chwsg.sh - emacs - tmux 80:2049132, zsh - tmux 126:2445806, wsp.cpp - emacs - tmux 87:2098353, foo.sh - emacs - tmux 123:2442046, chwsg.sh - emacs - tmux 124:2443368
-5:
-6: item.vala - emacs - tmux 97:2208949, zsh - tmux 111:2358834
-7: wm-msg - emacs - tmux 113:2384343, zsh - tmux 116:2392472
-8: EWMH Desktop Names Mapping - Brave
-*/
 std::vector<std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms) {
     std::vector<std::string> result;
-    if (!dpy) return result;
 
     Window root = DefaultRootWindow(dpy);
 
     Atom actualType;
     int actualFormat;
-    unsigned long nItems, bytesAfter;
+    unsigned long nitems, bytesAfter;
+    unsigned char* data = nullptr;
 
-    // -------- desktop count (fixed authoritative size) --------
-    long numDesktops = 0;
-    {
-        unsigned char* prop = nullptr;
-
-        if (XGetWindowProperty(dpy, root, atoms.net_number_of_desktops,
-                               0, 1, False, XA_CARDINAL,
-                               &actualType, &actualFormat,
-                               &nItems, &bytesAfter,
-                               &prop) == Success && prop) {
-            numDesktops = *(unsigned long*)prop;
-            XFree(prop);
-        }
-    }
-
-    if (numDesktops <= 0) numDesktops = 1;
-
-    std::vector<std::vector<std::string>> desktops(numDesktops);
-
-    // -------- client list --------
-    Window* clients = nullptr;
-    unsigned long clientCount = 0;
-
-    if (XGetWindowProperty(dpy, root, atoms.net_client_list,
-                           0, (~0L), False, XA_WINDOW,
-                           &actualType, &actualFormat,
-                           &clientCount, &bytesAfter,
-                           (unsigned char**)&clients) != Success || !clients) {
-        return result;
-    }
-
-    // -------- fill desktops --------
-    for (unsigned long i = 0; i < clientCount; ++i) {
-        Window w = clients[i];
-
-        unsigned char* deskProp = nullptr;
-        unsigned long desk = 0xFFFFFFFF;
-
-        if (XGetWindowProperty(dpy, w, atoms.net_wm_desktop,
-                               0, 1, False, XA_CARDINAL,
-                               &actualType, &actualFormat,
-                               &nItems, &bytesAfter,
-                               &deskProp) == Success && deskProp) {
-            desk = *(unsigned long*)deskProp;
-            XFree(deskProp);
+    if (XGetWindowProperty(dpy,
+                           root,
+                           atoms.net_client_list,
+                           0,
+                           (~0L),
+                           False,
+                           XA_WINDOW,
+                           &actualType,
+                           &actualFormat,
+                           &nitems,
+                           &bytesAfter,
+                           &data) != Success || !data)
+        {
+            return result;
         }
 
-        if (desk == 0xFFFFFFFF) {
-            continue; // sticky or unassigned
-        }
+    std::map<unsigned long, std::vector<std::string>> desktops;
 
-        if (desk >= (unsigned long)numDesktops) {
-            continue; // invalid/out-of-range
-        }
+    Window* windows = reinterpret_cast<Window*>(data);
+    unsigned long nwindows = nitems;
 
+    for (unsigned long i = 0; i < nwindows; ++i) {
+        Window w = windows[i];
+
+        // Desktop index
+        unsigned char* deskData = nullptr;
+        unsigned long desktopItems;
+
+        if (XGetWindowProperty(dpy,
+                               w,
+                               atoms.net_wm_desktop,
+                               0,
+                               1,
+                               False,
+                               XA_CARDINAL,
+                               &actualType,
+                               &actualFormat,
+                               &desktopItems,
+                               &bytesAfter,
+                               &deskData) != Success || !deskData)
+            {
+                continue;
+            }
+
+        unsigned long desktop = *reinterpret_cast<unsigned long*>(deskData);
+        XFree(deskData);
+
+        // Window title
         std::string title = getWindowTitle(dpy, w, atoms);
-        if (title.empty()) continue;
-
-        desktops[desk].push_back(title);
+        if (!title.empty())
+            desktops[desktop].push_back(std::move(title));
     }
 
-    if (clients) XFree(clients);
+    XFree(data);
 
-    // -------- format output --------
-    for (long d = 0; d < numDesktops; ++d) {
-        std::ostringstream oss;
+    int displayDesktop = 1;
+    for (const auto& [desktop, titles] : desktops) {
+        std::string line = std::to_string(displayDesktop++) + ": ";
 
-        auto& v = desktops[d];
-        for (size_t i = 0; i < v.size(); ++i) {
-            oss << v[i];
-            if (i + 1 < v.size()) oss << ", ";
+        for (size_t i = 0; i < titles.size(); ++i) {
+            if (i)
+                line += ", ";
+            line += titles[i];
         }
 
-        result.push_back(oss.str());
+        result.push_back(std::move(line));
     }
 
     return result;
@@ -973,6 +942,7 @@ static int run_daemon() {
                 // Drain the single-byte request token (content is ignored).
                 char token;
                 if ((read(client_fd, &token, 1)) < 1) {
+                    close(client_fd);
                     continue;
                 }
 
@@ -1095,7 +1065,7 @@ int run_picker(bool move_mode) {
         struct stat st;
         const std::string icon =
             (stat(ppm.c_str(), &st) == 0) ? ppm : "desktop";
-        oss << ">>j {\"name\":\"" << d << ": " << wins[idx]
+        oss << ">>j {\"name\":\"" << wins[idx]
             << "\",\"icon\":\"" << icon << "\"}\n";
     }
     if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
@@ -1280,7 +1250,7 @@ int main(int argc, char **argv) {
         auto desks = getDesktopNames(dpy, atoms);
         auto wins = getDesktopWindowTitles(dpy, atoms);
         for (const auto &[idx, d] : desks) {
-            printf("%s: %s\n", d.c_str(), wins[idx].c_str());
+            printf("%s\n", wins[idx].c_str());
         }
         XCloseDisplay(dpy);
         return 0;
