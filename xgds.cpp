@@ -149,6 +149,25 @@ static bool spawn_cmd(std::vector<std::string>& parts,
 }
 
 // ============================================================
+// X11 error handling
+// ============================================================
+
+// Xlib's default error handler calls exit() on any protocol error (e.g.
+// BadWindow from XGetWindowProperty on a window that has since been
+// destroyed). Since we routinely query windows we discovered a moment
+// earlier (_NET_CLIENT_LIST, _NET_ACTIVE_WINDOW), those windows can
+// legitimately disappear out from under us — that's not a bug, it's a
+// race against the rest of the desktop. Log and continue instead of
+// crashing the whole picker over one stale window.
+static int xerror_handler(Display *dpy, XErrorEvent *ev) {
+    static char buf[128];
+    XGetErrorText(dpy, ev->error_code, buf, sizeof(buf));
+    // fprintf(stderr, NAME ": X error ignored: %s (request %d.%d, resource 0x%lx)\n",
+    //         buf, ev->request_code, ev->minor_code, ev->resourceid);
+    return 0; // return value is ignored by Xlib
+}
+
+// ============================================================
 // X11 atoms — cached once per Display
 // ============================================================
 
@@ -1234,6 +1253,7 @@ int main(int argc, char **argv) {
 
     const char *cmd = argv[1];
 
+    XSetErrorHandler(xerror_handler);
     init_paths();
 
     if (!strcmp(cmd, "daemon")) {
