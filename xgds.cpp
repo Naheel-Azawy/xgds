@@ -68,6 +68,10 @@ static std::string desktop_screenshot_path(long desk) {
     return run_dir + "/" + std::to_string(desk) + ".ppm";
 }
 
+static std::string window_screenshot_path(Window w) {
+    return run_dir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
+}
+
 static void ensure_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) return;
@@ -416,6 +420,35 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms
     return result;
 }
 
+// Enumerate individual windows (in _NET_CLIENT_LIST order) with their titles.
+// Unlike getDesktopWindowTitles(), this keeps each window separate so a
+// specific one can be targeted for window switching.
+static std::vector<std::pair<Window, std::string>> getWindowList(Display* dpy, const Atoms& atoms) {
+    std::vector<std::pair<Window, std::string>> result;
+
+    Window root = DefaultRootWindow(dpy);
+
+    Atom actualType;
+    int actualFormat;
+    unsigned long nitems, bytesAfter;
+    unsigned char* data = nullptr;
+
+    if (XGetWindowProperty(dpy, root, atoms.net_client_list, 0, (~0L), False,
+                           XA_WINDOW, &actualType, &actualFormat,
+                           &nitems, &bytesAfter, &data) != Success || !data)
+        return result;
+
+    Window* windows = reinterpret_cast<Window*>(data);
+    for (unsigned long i = 0; i < nitems; ++i) {
+        std::string title = getWindowTitle(dpy, windows[i], atoms);
+        if (!title.empty())
+            result.emplace_back(windows[i], std::move(title));
+    }
+
+    XFree(data);
+    return result;
+}
+
 static bool switchDesktop(Display *dpy, long desktop, const Atoms& atoms) {
     Window root = DefaultRootWindow(dpy);
 
@@ -485,6 +518,27 @@ static bool moveFocusedWindowAndSwitch(Display *dpy, long desktop, const Atoms& 
     if (!moveFocusedWindowToDesktop(dpy, desktop, atoms))
         return false;
     return switchDesktop(dpy, desktop, atoms);
+}
+
+// Activate a specific window (switch to its desktop and raise/focus it),
+// per the EWMH _NET_ACTIVE_WINDOW client message convention.
+static bool switchWindow(Display *dpy, Window win, const Atoms& atoms) {
+    Window root = DefaultRootWindow(dpy);
+
+    XEvent ev{};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = win;
+    ev.xclient.message_type = atoms.net_active_window;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 2; // source indication: pager/task-switcher
+    ev.xclient.data.l[1] = CurrentTime;
+
+    XSendEvent(dpy, root, False,
+               SubstructureRedirectMask | SubstructureNotifyMask,
+               &ev);
+
+    XFlush(dpy);
+    return true;
 }
 
 // ============================================================
@@ -835,6 +889,26 @@ static bool capture_monitor_desktops(Display *dpy,
     return saved;
 }
 
+// Capture a single window's own contents (not a screen region) and save it.
+static bool save_window_screenshot(Display *dpy, Window win) {
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, win, &wa) || wa.map_state != IsViewable)
+        return false;
+
+    XImage *img = XGetImage(dpy, win, 0, 0, wa.width, wa.height, AllPlanes, ZPixmap);
+    if (!img) return false;
+
+    bool ok = save_ppm(dpy, img, window_screenshot_path(win).c_str());
+    XDestroyImage(img);
+    return ok;
+}
+
+// Screenshot every window individually, beside the per-desktop screenshots.
+static void capture_window_screenshots(Display *dpy, const Atoms& atoms) {
+    for (const auto &[win, title] : getWindowList(dpy, atoms))
+        save_window_screenshot(dpy, win);
+}
+
 static int run_daemon() {
     Display *dpy = XOpenDisplay(nullptr);
     if (!dpy) {
@@ -969,6 +1043,7 @@ static int run_daemon() {
 
                 if (token == 's') {
                     saved = capture_monitor_desktops(dpy, monitors, shms, atoms, saved);
+                    capture_window_screenshots(dpy, atoms);
                 }
 
                 // Reply goes back through the same connection — no race possible.
@@ -1056,7 +1131,9 @@ static int run_screenshot() {
 // Client: workspace picker via gmenu
 // ============================================================
 
-int run_picker(bool move_mode) {
+enum PickerMode { PICK_SWITCH, PICK_MOVE, PICK_WINDOW };
+
+int run_picker(PickerMode mode) {
     if (!require_daemon()) return 1;
 
     Display* dpy = XOpenDisplay(nullptr);
@@ -1064,6 +1141,8 @@ int run_picker(bool move_mode) {
     if (!client_screenshot())
         fprintf(stderr, NAME
                 ": screenshot failed — menu may show stale thumbnails\n");
+
+    bool move_mode = (mode == PICK_MOVE);
 
     auto cmd_change     = env_cmd(NAME_UPPER "_CHANGE_CMD");
     auto cmd_move       = env_cmd(NAME_UPPER "_MOVE_CMD");
@@ -1076,20 +1155,35 @@ int run_picker(bool move_mode) {
     auto desks = getDesktopNames(dpy, atoms);
     auto wins  = getDesktopWindowTitles(dpy, atoms);
 
+    // Only populated for PICK_WINDOW — pairs of (window id, title).
+    auto winlist = (mode == PICK_WINDOW) ? getWindowList(dpy, atoms)
+                                          : std::vector<std::pair<Window, std::string>>{};
+
     // Build the gmenu item list in memory (same format as before)
     std::ostringstream oss;
-    for (const auto &[idx, d] : desks) {
-        if (d.empty()) continue;
-        const std::string ppm = desktop_screenshot_path(idx);
-        struct stat st;
-        const std::string icon =
-            (stat(ppm.c_str(), &st) == 0) ? ppm : "desktop";
-        oss << ">>j {\"name\":\"" << wins[idx]
-            << "\",\"icon\":\"" << icon << "\"}\n";
-    }
-    if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
-        oss << ">>j {\"name\":\"New\","
-            "\"icon\":\"window-new-symbolic\",\"icon-size\":64}\n";
+    if (mode == PICK_WINDOW) {
+        for (const auto &[win, title] : winlist) {
+            const std::string ppm = window_screenshot_path(win);
+            struct stat st;
+            const std::string icon =
+                (stat(ppm.c_str(), &st) == 0) ? ppm : "window";
+            oss << ">>j {\"name\":\"" << title
+                << "\",\"icon\":\"" << icon << "\"}\n";
+        }
+    } else {
+        for (const auto &[idx, d] : desks) {
+            if (d.empty()) continue;
+            const std::string ppm = desktop_screenshot_path(idx);
+            struct stat st;
+            const std::string icon =
+                (stat(ppm.c_str(), &st) == 0) ? ppm : "desktop";
+            oss << ">>j {\"name\":\"" << wins[idx]
+                << "\",\"icon\":\"" << icon << "\"}\n";
+        }
+        if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
+            oss << ">>j {\"name\":\"New\","
+                "\"icon\":\"window-new-symbolic\",\"icon-size\":64}\n";
+        }
     }
     std::string items = oss.str();
 
@@ -1102,7 +1196,8 @@ int run_picker(bool move_mode) {
         return 1;
     }
 
-    const char* prompt = move_mode ? "Move window to workspace…" : "Workspaces";
+    const char* prompt = move_mode ? "Move window to workspace…" :
+                         mode == PICK_WINDOW ? "Switch window…" : "Workspaces";
 
     // Build argv for gmenu — no shell, no quoting worries
     char n_str[32];
@@ -1170,10 +1265,25 @@ int run_picker(bool move_mode) {
 
     if (choice.empty()) return 0;
 
-    bool is_new = (choice == "New" || choice.rfind("New", 0) == 0);
     std::size_t pos = choice.find(':');
     std::string choice_desk =
         (pos == std::string::npos) ? choice : choice.substr(0, pos);
+
+    if (mode == PICK_WINDOW) {
+        Window target = None;
+        for (const auto &[win, title] : winlist) {
+            if (choice_desk == title) { target = win; break; }
+        }
+        if (target == None) {
+            fprintf(stderr, NAME ": failed finding window id\n");
+            return 1;
+        }
+        switchWindow(dpy, target, atoms);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+
+    bool is_new = (choice == "New" || choice.rfind("New", 0) == 0);
 
     if (!cmd_change.empty() || !cmd_move.empty() ||
         !cmd_change_new.empty() || !cmd_move_new.empty()) {
@@ -1244,8 +1354,9 @@ static void usage(const char *argv0) {
             "  %s screenshot   capture the current desktop now\n"
             "  %s switch       open workspace picker and switch to selection\n"
             "  %s move         open workspace picker and move focused window\n"
+            "  %s switch-windows  open window picker and switch to selection\n"
             "  %s ls           list current desktops and windows\n",
-            argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -1261,9 +1372,11 @@ int main(int argc, char **argv) {
     } else if (!strcmp(cmd, "screenshot")) {
         return run_screenshot();
     } else if (!strcmp(cmd, "switch")) {
-        return run_picker(false);
+        return run_picker(PICK_SWITCH);
     } else if (!strcmp(cmd, "move")) {
-        return run_picker(true);
+        return run_picker(PICK_MOVE);
+    } else if (!strcmp(cmd, "switch-windows")) {
+        return run_picker(PICK_WINDOW);
     } else if (!strcmp(cmd, "ls")) {
         Display* dpy = XOpenDisplay(nullptr);
         const Atoms atoms = init_atoms(dpy);
