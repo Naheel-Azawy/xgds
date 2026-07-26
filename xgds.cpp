@@ -339,8 +339,8 @@ static std::string getWindowTitle(Display* dpy, Window w, const Atoms& atoms) {
     return {};
 }
 
-std::vector<std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms) {
-    std::vector<std::string> result;
+std::map<long, std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms) {
+    std::map<long, std::string> result;
 
     Window root = DefaultRootWindow(dpy);
 
@@ -414,7 +414,7 @@ std::vector<std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms
             line += titles[i];
         }
 
-        result.push_back(std::move(line));
+        result[static_cast<long>(desktop)] = std::move(line);
     }
 
     return result;
@@ -1177,7 +1177,10 @@ int run_picker(PickerMode mode) {
             struct stat st;
             const std::string icon =
                 (stat(ppm.c_str(), &st) == 0) ? ppm : "desktop";
-            oss << ">>j {\"name\":\"" << wins[idx]
+            const auto it = wins.find(idx);
+            const std::string &label =
+                (it != wins.end() && !it->second.empty()) ? it->second : d;
+            oss << ">>j {\"name\":\"" << label
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
         if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
@@ -1383,7 +1386,11 @@ int main(int argc, char **argv) {
         auto desks = getDesktopNames(dpy, atoms);
         auto wins = getDesktopWindowTitles(dpy, atoms);
         for (const auto &[idx, d] : desks) {
-            printf("%s\n", wins[idx].c_str());
+            const auto it = wins.find(idx);
+            if (it != wins.end() && !it->second.empty())
+                printf("%s: %s\n", d.c_str(), it->second.c_str());
+            else
+                printf("%s\n", d.c_str());
         }
         XCloseDisplay(dpy);
         return 0;
