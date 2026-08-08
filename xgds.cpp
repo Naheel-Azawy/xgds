@@ -1,5 +1,5 @@
 // xgds - X gmenu desktop switcher
-// Dependencies: X11, XShm, XRandR, gmenu
+// Dependencies: X11, XShm, XRandR, MagickWand, gmenu
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -7,7 +7,13 @@
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xrandr.h>
 
-#include <MagickWand/MagickWand.h>
+#if __has_include(<MagickWand/MagickWand.h>)
+#  include <MagickWand/MagickWand.h>
+#  define XGDS_IM7 1
+#else
+#  include <wand/MagickWand.h>
+#  define XGDS_IM7 0
+#endif
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -31,6 +37,13 @@
 #include <format>
 #include <vector>
 #include <map>
+#include <queue>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <algorithm>
 #include <sstream>
 #include <iostream>
 
@@ -72,14 +85,6 @@ static std::string desktop_screenshot_path(long desk) {
 
 static std::string window_screenshot_path(Window w) {
     return run_dir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
-}
-
-// Per-desktop metadata: geometry of every window on that desktop, relative
-// to the top-left corner of that desktop's screenshot. Written once per
-// screenshot capture; read on demand when the window picker needs to crop
-// a specific window out of the full desktop image.
-static std::string desktop_meta_path(long desk) {
-    return run_dir + "/" + std::to_string(desk) + ".meta";
 }
 
 static void ensure_dir(const char *path) {
@@ -460,12 +465,16 @@ static std::vector<std::pair<Window, std::string>> getWindowList(Display* dpy, c
 }
 
 // ============================================================
-// Window geometry metadata (for cropping windows out of desktop shots)
+// Window geometry metadata (for cropping/compositing window images)
 // ============================================================
 
-// A window's geometry, already made relative to some screenshot's origin.
+// A window's on-screen geometry, relative to the top-left of whichever
+// monitor screenshot it was captured from. Persisted per window (keyed by
+// its immutable window id), not per desktop: desktop *numbers* are
+// renumbered by the WM whenever desktops are inserted/removed, but a
+// window's id and its rough on-screen position don't change just because
+// some other desktop got renamed around it.
 struct WinMeta {
-    Window id;
     int x, y, w, h;
 };
 
@@ -527,43 +536,70 @@ static std::vector<WinGeom> getAllWindowGeometries(Display* dpy, const Atoms& at
     return result;
 }
 
-static void write_desktop_meta(long desk, const std::vector<WinMeta>& wins) {
-    const std::string path = desktop_meta_path(desk);
+// Live (uncached) grouping of windows by their current desktop. Always
+// queried fresh at the moment it's needed, so it's never stale relative to
+// desktop renumbering — unlike anything we might have cached from a
+// previous capture.
+static std::map<long, std::vector<Window>> getDesktopWindowIds(Display* dpy, const Atoms& atoms) {
+    std::map<long, std::vector<Window>> result;
+
+    Window root = DefaultRootWindow(dpy);
+
+    Atom actualType;
+    int actualFormat;
+    unsigned long nitems, bytesAfter;
+    unsigned char* data = nullptr;
+
+    if (XGetWindowProperty(dpy, root, atoms.net_client_list, 0, (~0L), False,
+                           XA_WINDOW, &actualType, &actualFormat,
+                           &nitems, &bytesAfter, &data) != Success || !data)
+        return result;
+
+    Window* windows = reinterpret_cast<Window*>(data);
+    for (unsigned long i = 0; i < nitems; ++i) {
+        Window w = windows[i];
+
+        unsigned char* deskData = nullptr;
+        unsigned long deskItems;
+
+        if (XGetWindowProperty(dpy, w, atoms.net_wm_desktop, 0, 1, False,
+                               XA_CARDINAL, &actualType, &actualFormat,
+                               &deskItems, &bytesAfter, &deskData) != Success
+            || !deskData)
+            continue;
+
+        long desktop = (long)*reinterpret_cast<unsigned long*>(deskData);
+        XFree(deskData);
+
+        result[desktop].push_back(w);
+    }
+
+    XFree(data);
+    return result;
+}
+
+static std::string window_meta_path(Window w) {
+    return run_dir + "/win-" + std::to_string((unsigned long)w) + ".meta";
+}
+
+static void write_window_meta(Window w, int x, int y, int width, int height) {
+    const std::string path = window_meta_path(w);
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) {
         fprintf(stderr, NAME ": fopen(%s): %s\n", path.c_str(), strerror(errno));
         return;
     }
-    for (const auto& m : wins)
-        fprintf(fp, "%lu %d %d %d %d\n", (unsigned long)m.id, m.x, m.y, m.w, m.h);
+    fprintf(fp, "%d %d %d %d\n", x, y, width, height);
     fclose(fp);
 }
 
-static std::vector<WinMeta> read_desktop_meta(long desk) {
-    std::vector<WinMeta> out;
-    const std::string path = desktop_meta_path(desk);
+static bool read_window_meta(Window w, WinMeta &out) {
+    const std::string path = window_meta_path(w);
     FILE* fp = fopen(path.c_str(), "r");
-    if (!fp) return out;
-
-    unsigned long id;
-    int x, y, w, h;
-    while (fscanf(fp, "%lu %d %d %d %d", &id, &x, &y, &w, &h) == 5)
-        out.push_back({ (Window)id, x, y, w, h });
-
+    if (!fp) return false;
+    bool ok = fscanf(fp, "%d %d %d %d", &out.x, &out.y, &out.w, &out.h) == 4;
     fclose(fp);
-    return out;
-}
-
-// Load geometry metadata for every desktop and index it by window id, so a
-// window picker can find both which desktop a window is on and where it
-// sits within that desktop's screenshot, without touching X at all.
-static std::map<Window, std::pair<long, WinMeta>>
-load_all_window_meta(const std::map<long, std::string>& desks) {
-    std::map<Window, std::pair<long, WinMeta>> out;
-    for (const auto& [idx, name] : desks)
-        for (const auto& m : read_desktop_meta(idx))
-            out[m.id] = { idx, m };
-    return out;
+    return ok;
 }
 
 static bool switchDesktop(Display *dpy, long desktop, const Atoms& atoms) {
@@ -877,9 +913,337 @@ static bool crop_window_screenshot(const std::string &desktop_ppm,
     return ok;
 }
 
+// Recreate a desktop's screenshot from its windows' persisted crops. Desktop
+// *numbers* get renumbered by the WM whenever a desktop is inserted or
+// removed, so nothing here is keyed by desktop index — the caller passes in
+// the window ids currently on that desktop (queried live), and each
+// window's own image/geometry is looked up by its immutable id. The result
+// is always consistent with the current desktop layout, never stale.
+/* static bool composite_desktop_screenshot_bak(const std::vector<Window> &ids,
+                                         const std::string &out_path) {
+    struct Placed { Window id; WinMeta m; };
+    std::vector<Placed> placed;
+
+    int canvas_w = 0, canvas_h = 0;
+    for (Window id : ids) {
+        WinMeta m;
+        if (!read_window_meta(id, m)) continue;
+        struct stat st;
+        if (stat(window_screenshot_path(id).c_str(), &st) != 0) continue;
+        placed.push_back({ id, m });
+        canvas_w = std::max(canvas_w, m.x + m.w);
+        canvas_h = std::max(canvas_h, m.y + m.h);
+    }
+    if (placed.empty()) return false;
+
+    PixelWand *bg = NewPixelWand();
+    PixelSetColor(bg, "gray20");
+
+    MagickWand *canvas = NewMagickWand();
+    bool ok = false;
+
+    if (MagickNewImage(canvas, (size_t)canvas_w, (size_t)canvas_h, bg) == MagickTrue) {
+        bool placed_any = false;
+        for (const auto &p : placed) {
+            MagickWand *win = NewMagickWand();
+            bool read_ok = MagickReadImage(win, window_screenshot_path(p.id).c_str()) == MagickTrue;
+#if XGDS_IM7
+            bool composited = read_ok &&
+                MagickCompositeImage(canvas, win, OverCompositeOp, MagickTrue,
+                                     p.m.x, p.m.y) == MagickTrue;
+#else
+            bool composited = read_ok &&
+                MagickCompositeImage(canvas, win, OverCompositeOp,
+                                     p.m.x, p.m.y) == MagickTrue;
+#endif
+            if (composited) {
+                placed_any = true;
+            }
+            win = DestroyMagickWand(win);
+        }
+        ok = placed_any && (MagickWriteImage(canvas, out_path.c_str()) == MagickTrue);
+    }
+
+    canvas = DestroyMagickWand(canvas);
+    bg = DestroyPixelWand(bg);
+    return ok;
+}*/
+
+// Recreate a desktop's screenshot from its windows' persisted crops. Desktop
+// *numbers* get renumbered by the WM whenever a desktop is inserted or
+// removed, so nothing here is keyed by desktop index — the caller passes in
+// the window ids currently on that desktop (queried live), and each
+// window's own image/geometry is looked up by its immutable id. The result
+// is always consistent with the current desktop layout, never stale.
+// Note that the below is an optimized version of the above, pure ppm.
+static bool composite_desktop_screenshot(const std::vector<Window> &ids,
+                                         const std::string &out_path) {
+    struct Placed {
+        Window id;
+        WinMeta m;
+        std::string path;
+    };
+
+    std::vector<Placed> placed;
+    placed.reserve(ids.size());
+
+    int canvas_w = 0;
+    int canvas_h = 0;
+
+    // First collect valid windows.
+    for (Window id : ids) {
+        WinMeta m;
+        if (!read_window_meta(id, m))
+            continue;
+
+        const std::string path = window_screenshot_path(id);
+
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0 || st.st_size <= 0)
+            continue;
+
+        placed.push_back({id, m, path});
+
+        canvas_w = std::max(canvas_w, m.x + m.w);
+        canvas_h = std::max(canvas_h, m.y + m.h);
+    }
+
+    if (placed.empty() || canvas_w <= 0 || canvas_h <= 0)
+        return false;
+
+    /*
+     * RGB canvas.
+     *
+     * Change these three values to whatever background you want.
+     * Current color is a dark blue/gray.
+     */
+    constexpr unsigned char BG_R = 32;
+    constexpr unsigned char BG_G = 40;
+    constexpr unsigned char BG_B = 56;
+
+    const size_t canvas_stride = static_cast<size_t>(canvas_w) * 3;
+    const size_t canvas_size =
+        static_cast<size_t>(canvas_h) * canvas_stride;
+
+    std::vector<unsigned char> canvas(canvas_size);
+
+    // Fill background.
+    for (int y = 0; y < canvas_h; ++y) {
+        unsigned char* row = canvas.data() +
+                             static_cast<size_t>(y) * canvas_stride;
+
+        for (int x = 0; x < canvas_w; ++x) {
+            row[x * 3 + 0] = BG_R;
+            row[x * 3 + 1] = BG_G;
+            row[x * 3 + 2] = BG_B;
+        }
+    }
+
+    bool placed_any = false;
+
+    for (const auto& p : placed) {
+        FILE* f = fopen(p.path.c_str(), "rb");
+        if (!f)
+            continue;
+
+        /*
+         * PPM header:
+         *
+         * P6
+         * width height
+         * 255
+         *
+         * We parse it rather than using ImageMagick.
+         */
+        char magic[3] = {};
+        if (fscanf(f, "%2s", magic) != 1 ||
+            strcmp(magic, "P6") != 0) {
+            fclose(f);
+            continue;
+        }
+
+        auto skip_comments = [&]() {
+            int c;
+
+            while ((c = fgetc(f)) != EOF) {
+                if (isspace(c))
+                    continue;
+
+                if (c == '#') {
+                    while ((c = fgetc(f)) != EOF && c != '\n')
+                        ;
+                    continue;
+                }
+
+                ungetc(c, f);
+                break;
+            }
+        };
+
+        int w = 0;
+        int h = 0;
+        int maxval = 0;
+
+        skip_comments();
+        if (fscanf(f, "%d", &w) != 1) {
+            fclose(f);
+            continue;
+        }
+
+        skip_comments();
+        if (fscanf(f, "%d", &h) != 1) {
+            fclose(f);
+            continue;
+        }
+
+        skip_comments();
+        if (fscanf(f, "%d", &maxval) != 1) {
+            fclose(f);
+            continue;
+        }
+
+        if (w <= 0 || h <= 0 || maxval != 255) {
+            fclose(f);
+            continue;
+        }
+
+        // Consume the whitespace after maxval.
+        fgetc(f);
+
+        const size_t row_bytes = static_cast<size_t>(w) * 3;
+
+        std::vector<unsigned char> row(row_bytes);
+
+        for (int y = 0; y < h; ++y) {
+            if (fread(row.data(), 1, row_bytes, f) != row_bytes)
+                break;
+
+            const int dst_y = p.m.y + y;
+
+            if (dst_y < 0 || dst_y >= canvas_h)
+                continue;
+
+            const int src_x = std::max(0, -p.m.x);
+            const int dst_x = std::max(0, p.m.x);
+
+            const int copy_width =
+                std::min(w - src_x, canvas_w - dst_x);
+
+            if (copy_width <= 0)
+                continue;
+
+            unsigned char* dst =
+                canvas.data() +
+                static_cast<size_t>(dst_y) * canvas_stride +
+                static_cast<size_t>(dst_x) * 3;
+
+            const unsigned char* src =
+                row.data() +
+                static_cast<size_t>(src_x) * 3;
+
+            memcpy(dst, src, static_cast<size_t>(copy_width) * 3);
+        }
+
+        fclose(f);
+        placed_any = true;
+    }
+
+    if (!placed_any)
+        return false;
+
+    /*
+     * Write the final image.
+     *
+     * If out_path is .ppm, this is extremely fast.
+     */
+    FILE* out = fopen(out_path.c_str(), "wb");
+    if (!out)
+        return false;
+
+    fprintf(out, "P6\n%d %d\n255\n", canvas_w, canvas_h);
+
+    const bool write_ok =
+        fwrite(canvas.data(), 1, canvas.size(), out) == canvas.size();
+
+    fclose(out);
+
+    return write_ok;
+}
+
+
 // ============================================================
-// Daemon: trigger screenshot via Unix socket, save ppm
+// Async window-crop queue
 // ============================================================
+//
+// Screenshot capture must stay fast, since it happens on every desktop
+// switch. Cropping the individual windows out of it is comparatively slow
+// (one decode+crop+encode per window) and nothing waiting on the client
+// side actually needs it to finish before the switch proceeds. So capture
+// only writes the full per-monitor screenshot and hands off, and a
+// background thread does the cropping afterwards.
+//
+// A monitor's temporary screenshot file is shared by every window that was
+// on that desktop when it was captured. It's wrapped in a ScreenshotRef and
+// handed out via shared_ptr; once the last CropJob referencing it has been
+// popped and destroyed, the shared_ptr refcount hits zero and the
+// ScreenshotRef destructor deletes the temporary file — i.e. the file goes
+// away automatically exactly when "all windows from a given desktop" have
+// been cropped, with no separate bookkeeping required.
+
+struct ScreenshotRef {
+    std::string path;
+    explicit ScreenshotRef(std::string p) : path(std::move(p)) {}
+    ~ScreenshotRef() { unlink(path.c_str()); }
+};
+
+struct CropJob {
+    std::shared_ptr<ScreenshotRef> screenshot;
+    Window win;
+    int x, y, w, h;
+};
+
+static std::mutex              g_crop_mutex;
+static std::condition_variable g_crop_cv;
+static std::queue<CropJob>     g_crop_queue;
+static std::atomic<bool>       g_crop_stop{false};
+
+static void enqueue_crop_jobs(std::vector<CropJob> jobs) {
+    if (jobs.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_crop_mutex);
+        for (auto &j : jobs) g_crop_queue.push(std::move(j));
+    }
+    g_crop_cv.notify_all();
+}
+
+static void crop_worker() {
+    for (;;) {
+        CropJob job;
+        {
+            std::unique_lock<std::mutex> lock(g_crop_mutex);
+            g_crop_cv.wait(lock, [] {
+                return !g_crop_queue.empty() || g_crop_stop.load();
+            });
+            if (g_crop_queue.empty()) {
+                if (g_crop_stop.load()) return;
+                continue;
+            }
+            job = std::move(g_crop_queue.front());
+            g_crop_queue.pop();
+        }
+
+        if (crop_window_screenshot(job.screenshot->path, job.x, job.y,
+                                   job.w, job.h,
+                                   window_screenshot_path(job.win))) {
+            write_window_meta(job.win, job.x, job.y, job.w, job.h);
+        }
+        // job (and its shared_ptr<ScreenshotRef>) is destroyed here; once
+        // every job sharing this screenshot has gone through this path,
+        // ScreenshotRef's destructor removes the temp file.
+    }
+}
+
+
 
 // Send the ack reply back through the already-connected client socket.
 static void daemon_send_ack(int client_fd, bool ok) {
@@ -1029,28 +1393,35 @@ static bool capture_monitor_desktops(Display *dpy,
     // queries only, no pixel data) compared to rasterizing window contents.
     const std::vector<WinGeom> all_wins = getAllWindowGeometries(dpy, atoms);
 
-    // Capture every monitor, save its PPM, and record the geometry of every
-    // window on that desktop relative to the screenshot's origin. Individual
-    // windows are no longer screenshotted here — switch-window crops them
-    // out of this desktop image on demand using this metadata.
+    // Capture every monitor and save its PPM — this is the only part that
+    // has to be fast, since it happens on every desktop switch. Cropping
+    // individual windows out of it is handed off to the background queue;
+    // this function returns as soon as the raw screenshots are on disk.
     int saved_count = 0;
     for (size_t mi = 0; mi < monitors.size(); ++mi) {
         long desk = ((long)mi == current_mon) ?
             current_desk : mon_desk[mi];
         grab_monitor(dpy, monitors[mi], shms[mi]);
         std::string path = desktop_screenshot_path(desk);
-        if (save_ppm(dpy, shms[mi].img, path.c_str()))
-            ++saved_count;
+        if (!save_ppm(dpy, shms[mi].img, path.c_str()))
+            continue;
+        ++saved_count;
 
-        std::vector<WinMeta> metas;
+        // Reference-counted handle to the temp screenshot: it's deleted
+        // automatically once every job below has consumed it (see
+        // ScreenshotRef). If this desktop has no windows, the shared_ptr
+        // simply goes out of scope at the end of this iteration and the
+        // file is removed immediately.
+        auto screenshot = std::make_shared<ScreenshotRef>(path);
+
+        std::vector<CropJob> jobs;
         for (const auto& g : all_wins) {
             if (g.desktop != desk) continue;
-            metas.push_back({ g.id,
-                              g.x - monitors[mi].x,
-                              g.y - monitors[mi].y,
-                              g.w, g.h });
+            jobs.push_back({ screenshot, g.id,
+                             g.x - monitors[mi].x, g.y - monitors[mi].y,
+                             g.w, g.h });
         }
-        write_desktop_meta(desk, metas);
+        enqueue_crop_jobs(std::move(jobs));
     }
 
     saved = (saved_count > 0);
@@ -1119,6 +1490,12 @@ static int run_daemon() {
     // Cache all needed atoms once — XInternAtom round-trips are cheap
     // but there is no reason to repeat them on every screenshot request.
     const Atoms atoms = init_atoms(dpy);
+
+    // Background thread that crops individual windows out of the desktop
+    // screenshots asynchronously (see enqueue_crop_jobs/crop_worker). It
+    // only touches files via MagickWand, never X, so it's safe to run
+    // alongside the X11 event loop below without any Xlib locking.
+    std::thread worker(crop_worker);
 
     printf(NAME " daemon: ready — listening on %s\n", sock_path.c_str());
     fflush(stdout);
@@ -1200,6 +1577,10 @@ static int run_daemon() {
         }
         // X11 activity is handled at the top of the loop via XPending().
     }
+
+    g_crop_stop.store(true);
+    g_crop_cv.notify_all();
+    worker.join();
 
     for (auto &s : shms) shm_free(dpy, s);
     close(srv);
@@ -1306,29 +1687,18 @@ int run_picker(PickerMode mode) {
     auto winlist = (mode == PICK_WINDOW) ? getWindowList(dpy, atoms)
                                           : std::vector<std::pair<Window, std::string>>{};
 
-    // Only populated for PICK_WINDOW — window id -> (desktop, geometry),
-    // read from the metadata the daemon wrote alongside the desktop shots.
-    auto win_meta = (mode == PICK_WINDOW) ? load_all_window_meta(desks)
-                                          : std::map<Window, std::pair<long, WinMeta>>{};
-    if (mode == PICK_WINDOW) MagickWandGenesis();
-
     // Build the gmenu item list in memory (same format as before)
     std::ostringstream oss;
     if (mode == PICK_WINDOW) {
+        // The daemon crops these asynchronously in the background; we just
+        // use whatever's on disk already (falling back to the generic
+        // "window" icon if a crop hasn't landed yet, e.g. right after the
+        // very first screenshot before the worker catches up).
         for (const auto &[win, title] : winlist) {
-            std::string icon = "window";
-
-            const auto mit = win_meta.find(win);
-            if (mit != win_meta.end()) {
-                const auto &[desk, m] = mit->second;
-                const std::string desktop_ppm = desktop_screenshot_path(desk);
-                const std::string out_ppm = window_screenshot_path(win);
-                struct stat st;
-                if (stat(desktop_ppm.c_str(), &st) == 0 &&
-                    crop_window_screenshot(desktop_ppm, m.x, m.y, m.w, m.h, out_ppm)) {
-                    icon = out_ppm;
-                }
-            }
+            const std::string ppm = window_screenshot_path(win);
+            struct stat st;
+            const std::string icon =
+                (stat(ppm.c_str(), &st) == 0) ? ppm : "window";
 
             // Encode the window id as a prefix ("id:title"); the generic
             // colon-split below hands us the id back untouched, so
@@ -1336,20 +1706,33 @@ int run_picker(PickerMode mode) {
             oss << ">>j {\"name\":\"" << (unsigned long)win << ":" << title
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
-        MagickWandTerminus();
     } else {
+        // Desktop numbers can be renumbered by the WM (e.g. inserting a
+        // desktop in the middle shifts every later one), so we never trust
+        // any previously-captured desktop screenshot here. Instead, query
+        // which windows are on which desktop right now and rebuild each
+        // desktop's screenshot from the windows' own (id-keyed, therefore
+        // renumbering-proof) persisted crops.
+        auto desk_windows = getDesktopWindowIds(dpy, atoms);
+        MagickWandGenesis();
         for (const auto &[idx, d] : desks) {
             if (d.empty()) continue;
-            const std::string ppm = desktop_screenshot_path(idx);
-            struct stat st;
-            const std::string icon =
-                (stat(ppm.c_str(), &st) == 0) ? ppm : "desktop";
+
+            std::string icon = "desktop";
+            const auto wit = desk_windows.find(idx);
+            if (wit != desk_windows.end() && !wit->second.empty()) {
+                const std::string out = desktop_screenshot_path(idx);
+                if (composite_desktop_screenshot(wit->second, out))
+                    icon = out;
+            }
+
             const auto it = wins.find(idx);
             const std::string &label =
                 (it != wins.end() && !it->second.empty()) ? it->second : d;
             oss << ">>j {\"name\":\"" << label
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
+        MagickWandTerminus();
         if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
             oss << ">>j {\"name\":\"New\","
                 "\"icon\":\"window-new-symbolic\",\"icon-size\":64}\n";
