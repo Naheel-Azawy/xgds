@@ -7,6 +7,8 @@
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xrandr.h>
 
+#include <MagickWand/MagickWand.h>
+
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
@@ -70,6 +72,14 @@ static std::string desktop_screenshot_path(long desk) {
 
 static std::string window_screenshot_path(Window w) {
     return run_dir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
+}
+
+// Per-desktop metadata: geometry of every window on that desktop, relative
+// to the top-left corner of that desktop's screenshot. Written once per
+// screenshot capture; read on demand when the window picker needs to crop
+// a specific window out of the full desktop image.
+static std::string desktop_meta_path(long desk) {
+    return run_dir + "/" + std::to_string(desk) + ".meta";
 }
 
 static void ensure_dir(const char *path) {
@@ -449,6 +459,113 @@ static std::vector<std::pair<Window, std::string>> getWindowList(Display* dpy, c
     return result;
 }
 
+// ============================================================
+// Window geometry metadata (for cropping windows out of desktop shots)
+// ============================================================
+
+// A window's geometry, already made relative to some screenshot's origin.
+struct WinMeta {
+    Window id;
+    int x, y, w, h;
+};
+
+// Same, but still in root-window (absolute) coordinates and tagged with the
+// desktop the window currently lives on. Used only while capturing.
+struct WinGeom {
+    Window id;
+    long   desktop;
+    int    x, y, w, h;
+};
+
+// Enumerate every mapped client window with its desktop and absolute
+// on-screen geometry. This is cheap (a handful of property/attribute
+// queries per window) compared to actually rasterizing window contents.
+static std::vector<WinGeom> getAllWindowGeometries(Display* dpy, const Atoms& atoms) {
+    std::vector<WinGeom> result;
+
+    Window root = DefaultRootWindow(dpy);
+
+    Atom actualType;
+    int actualFormat;
+    unsigned long nitems, bytesAfter;
+    unsigned char* data = nullptr;
+
+    if (XGetWindowProperty(dpy, root, atoms.net_client_list, 0, (~0L), False,
+                           XA_WINDOW, &actualType, &actualFormat,
+                           &nitems, &bytesAfter, &data) != Success || !data)
+        return result;
+
+    Window* windows = reinterpret_cast<Window*>(data);
+    for (unsigned long i = 0; i < nitems; ++i) {
+        Window w = windows[i];
+
+        unsigned char* deskData = nullptr;
+        unsigned long deskItems;
+        long desktop = -1;
+
+        if (XGetWindowProperty(dpy, w, atoms.net_wm_desktop, 0, 1, False,
+                               XA_CARDINAL, &actualType, &actualFormat,
+                               &deskItems, &bytesAfter, &deskData) == Success
+            && deskData) {
+            desktop = (long)*reinterpret_cast<unsigned long*>(deskData);
+            XFree(deskData);
+        }
+        if (desktop < 0) continue;
+
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(dpy, w, &wa) || wa.map_state != IsViewable)
+            continue;
+
+        Window child;
+        int rx = wa.x, ry = wa.y;
+        XTranslateCoordinates(dpy, w, root, 0, 0, &rx, &ry, &child);
+
+        result.push_back({ w, desktop, rx, ry, wa.width, wa.height });
+    }
+
+    XFree(data);
+    return result;
+}
+
+static void write_desktop_meta(long desk, const std::vector<WinMeta>& wins) {
+    const std::string path = desktop_meta_path(desk);
+    FILE* fp = fopen(path.c_str(), "w");
+    if (!fp) {
+        fprintf(stderr, NAME ": fopen(%s): %s\n", path.c_str(), strerror(errno));
+        return;
+    }
+    for (const auto& m : wins)
+        fprintf(fp, "%lu %d %d %d %d\n", (unsigned long)m.id, m.x, m.y, m.w, m.h);
+    fclose(fp);
+}
+
+static std::vector<WinMeta> read_desktop_meta(long desk) {
+    std::vector<WinMeta> out;
+    const std::string path = desktop_meta_path(desk);
+    FILE* fp = fopen(path.c_str(), "r");
+    if (!fp) return out;
+
+    unsigned long id;
+    int x, y, w, h;
+    while (fscanf(fp, "%lu %d %d %d %d", &id, &x, &y, &w, &h) == 5)
+        out.push_back({ (Window)id, x, y, w, h });
+
+    fclose(fp);
+    return out;
+}
+
+// Load geometry metadata for every desktop and index it by window id, so a
+// window picker can find both which desktop a window is on and where it
+// sits within that desktop's screenshot, without touching X at all.
+static std::map<Window, std::pair<long, WinMeta>>
+load_all_window_meta(const std::map<long, std::string>& desks) {
+    std::map<Window, std::pair<long, WinMeta>> out;
+    for (const auto& [idx, name] : desks)
+        for (const auto& m : read_desktop_meta(idx))
+            out[m.id] = { idx, m };
+    return out;
+}
+
 static bool switchDesktop(Display *dpy, long desktop, const Atoms& atoms) {
     Window root = DefaultRootWindow(dpy);
 
@@ -726,6 +843,40 @@ static bool save_ppm(Display *dpy, XImage *img, const char *path) {
     return ok;
 }
 
+// Crop a window's rectangle out of an already-captured desktop screenshot
+// and write it to its own file. This replaces per-window XGetImage() calls:
+// no extra round-trip to the X server, just a decode+crop+encode on an
+// image already sitting on disk. Coordinates are clamped to the source
+// image bounds in case a window is partially off-screen.
+static bool crop_window_screenshot(const std::string &desktop_ppm,
+                                   int x, int y, int w, int h,
+                                   const std::string &out_path) {
+    if (w <= 0 || h <= 0) return false;
+
+    MagickWand *wand = NewMagickWand();
+    bool ok = false;
+
+    if (MagickReadImage(wand, desktop_ppm.c_str()) == MagickTrue) {
+        long iw = (long)MagickGetImageWidth(wand);
+        long ih = (long)MagickGetImageHeight(wand);
+
+        long cx = x, cy = y, cw = w, ch = h;
+        if (cx < 0) { cw += cx; cx = 0; }
+        if (cy < 0) { ch += cy; cy = 0; }
+        if (cx + cw > iw) cw = iw - cx;
+        if (cy + ch > ih) ch = ih - cy;
+
+        if (cw > 0 && ch > 0 &&
+            MagickCropImage(wand, (size_t)cw, (size_t)ch, cx, cy) == MagickTrue &&
+            MagickWriteImage(wand, out_path.c_str()) == MagickTrue) {
+            ok = true;
+        }
+    }
+
+    wand = DestroyMagickWand(wand);
+    return ok;
+}
+
 // ============================================================
 // Daemon: trigger screenshot via Unix socket, save ppm
 // ============================================================
@@ -874,7 +1025,14 @@ static bool capture_monitor_desktops(Display *dpy,
             current_mon = mi;
     }
 
-    // Capture every monitor and save its PPM.
+    // Gather every window's absolute geometry once; cheap (attribute/property
+    // queries only, no pixel data) compared to rasterizing window contents.
+    const std::vector<WinGeom> all_wins = getAllWindowGeometries(dpy, atoms);
+
+    // Capture every monitor, save its PPM, and record the geometry of every
+    // window on that desktop relative to the screenshot's origin. Individual
+    // windows are no longer screenshotted here — switch-window crops them
+    // out of this desktop image on demand using this metadata.
     int saved_count = 0;
     for (size_t mi = 0; mi < monitors.size(); ++mi) {
         long desk = ((long)mi == current_mon) ?
@@ -883,30 +1041,20 @@ static bool capture_monitor_desktops(Display *dpy,
         std::string path = desktop_screenshot_path(desk);
         if (save_ppm(dpy, shms[mi].img, path.c_str()))
             ++saved_count;
+
+        std::vector<WinMeta> metas;
+        for (const auto& g : all_wins) {
+            if (g.desktop != desk) continue;
+            metas.push_back({ g.id,
+                              g.x - monitors[mi].x,
+                              g.y - monitors[mi].y,
+                              g.w, g.h });
+        }
+        write_desktop_meta(desk, metas);
     }
 
     saved = (saved_count > 0);
     return saved;
-}
-
-// Capture a single window's own contents (not a screen region) and save it.
-static bool save_window_screenshot(Display *dpy, Window win) {
-    XWindowAttributes wa;
-    if (!XGetWindowAttributes(dpy, win, &wa) || wa.map_state != IsViewable)
-        return false;
-
-    XImage *img = XGetImage(dpy, win, 0, 0, wa.width, wa.height, AllPlanes, ZPixmap);
-    if (!img) return false;
-
-    bool ok = save_ppm(dpy, img, window_screenshot_path(win).c_str());
-    XDestroyImage(img);
-    return ok;
-}
-
-// Screenshot every window individually, beside the per-desktop screenshots.
-static void capture_window_screenshots(Display *dpy, const Atoms& atoms) {
-    for (const auto &[win, title] : getWindowList(dpy, atoms))
-        save_window_screenshot(dpy, win);
 }
 
 static int run_daemon() {
@@ -1043,7 +1191,6 @@ static int run_daemon() {
 
                 if (token == 's') {
                     saved = capture_monitor_desktops(dpy, monitors, shms, atoms, saved);
-                    capture_window_screenshots(dpy, atoms);
                 }
 
                 // Reply goes back through the same connection — no race possible.
@@ -1159,17 +1306,37 @@ int run_picker(PickerMode mode) {
     auto winlist = (mode == PICK_WINDOW) ? getWindowList(dpy, atoms)
                                           : std::vector<std::pair<Window, std::string>>{};
 
+    // Only populated for PICK_WINDOW — window id -> (desktop, geometry),
+    // read from the metadata the daemon wrote alongside the desktop shots.
+    auto win_meta = (mode == PICK_WINDOW) ? load_all_window_meta(desks)
+                                          : std::map<Window, std::pair<long, WinMeta>>{};
+    if (mode == PICK_WINDOW) MagickWandGenesis();
+
     // Build the gmenu item list in memory (same format as before)
     std::ostringstream oss;
     if (mode == PICK_WINDOW) {
         for (const auto &[win, title] : winlist) {
-            const std::string ppm = window_screenshot_path(win);
-            struct stat st;
-            const std::string icon =
-                (stat(ppm.c_str(), &st) == 0) ? ppm : "window";
-            oss << ">>j {\"name\":\"" << title
+            std::string icon = "window";
+
+            const auto mit = win_meta.find(win);
+            if (mit != win_meta.end()) {
+                const auto &[desk, m] = mit->second;
+                const std::string desktop_ppm = desktop_screenshot_path(desk);
+                const std::string out_ppm = window_screenshot_path(win);
+                struct stat st;
+                if (stat(desktop_ppm.c_str(), &st) == 0 &&
+                    crop_window_screenshot(desktop_ppm, m.x, m.y, m.w, m.h, out_ppm)) {
+                    icon = out_ppm;
+                }
+            }
+
+            // Encode the window id as a prefix ("id:title"); the generic
+            // colon-split below hands us the id back untouched, so
+            // selection never depends on matching title text.
+            oss << ">>j {\"name\":\"" << (unsigned long)win << ":" << title
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
+        MagickWandTerminus();
     } else {
         for (const auto &[idx, d] : desks) {
             if (d.empty()) continue;
@@ -1273,11 +1440,10 @@ int run_picker(PickerMode mode) {
         (pos == std::string::npos) ? choice : choice.substr(0, pos);
 
     if (mode == PICK_WINDOW) {
-        Window target = None;
-        for (const auto &[win, title] : winlist) {
-            if (choice_desk == title) { target = win; break; }
-        }
-        if (target == None) {
+        errno = 0;
+        char *end = nullptr;
+        Window target = (Window)strtoul(choice_desk.c_str(), &end, 10);
+        if (target == None || errno != 0 || end == choice_desk.c_str()) {
             fprintf(stderr, NAME ": failed finding window id\n");
             return 1;
         }
