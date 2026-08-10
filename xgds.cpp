@@ -83,6 +83,23 @@ static std::string desktop_screenshot_path(long desk) {
     return run_dir + "/" + std::to_string(desk) + ".ppm";
 }
 
+// Temp file for a single monitor's raw capture, used only as input to the
+// background crop queue (see ScreenshotRef) and deleted once every window
+// crop has consumed it. This must NOT share a name with
+// desktop_screenshot_path(): that path is also written by the picker
+// (composite_desktop_screenshot) as the persistent "current desktop icon"
+// file, and if the two collided, the daemon's worker thread could delete
+// or overwrite the picker's freshly-composited icon out from under it —
+// which is exactly what caused the current desktop to intermittently
+// vanish from `xgds switch`. A monotonic sequence number keeps every
+// capture's filename unique even across rapid back-to-back requests.
+static std::atomic<unsigned long> g_capture_seq{0};
+
+static std::string raw_capture_path(size_t monitor_index) {
+    return run_dir + "/cap-" + std::to_string(monitor_index) + "-" +
+           std::to_string(g_capture_seq.fetch_add(1)) + ".ppm";
+}
+
 static std::string window_screenshot_path(Window w) {
     return run_dir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
 }
@@ -1402,7 +1419,7 @@ static bool capture_monitor_desktops(Display *dpy,
         long desk = ((long)mi == current_mon) ?
             current_desk : mon_desk[mi];
         grab_monitor(dpy, monitors[mi], shms[mi]);
-        std::string path = desktop_screenshot_path(desk);
+        std::string path = raw_capture_path(mi);
         if (!save_ppm(dpy, shms[mi].img, path.c_str()))
             continue;
         ++saved_count;
