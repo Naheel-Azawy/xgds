@@ -1,19 +1,17 @@
 // xgds - X gmenu desktop switcher
-// Dependencies: X11, XShm, XRandR, MagickWand, gmenu
+// Dependencies: X11, XShm, XRandR, gmenu
+//
+// Screenshots are handled as raw P6 PPMs end-to-end (capture, crop,
+// composite) with plain fread/fwrite/memcpy — see save_ppm,
+// crop_window_screenshot, and composite_desktop_screenshot. There is
+// intentionally no image-library dependency: every file this program reads
+// was written by this program, so there's no format to negotiate.
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xrandr.h>
-
-#if __has_include(<MagickWand/MagickWand.h>)
-#  include <MagickWand/MagickWand.h>
-#  define XGDS_IM7 1
-#else
-#  include <wand/MagickWand.h>
-#  define XGDS_IM7 0
-#endif
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -29,6 +27,7 @@
 #include <signal.h>
 
 #include <climits>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -898,36 +897,93 @@ static bool save_ppm(Display *dpy, XImage *img, const char *path) {
 
 // Crop a window's rectangle out of an already-captured desktop screenshot
 // and write it to its own file. This replaces per-window XGetImage() calls:
-// no extra round-trip to the X server, just a decode+crop+encode on an
-// image already sitting on disk. Coordinates are clamped to the source
-// image bounds in case a window is partially off-screen.
+// no extra round-trip to the X server, just a read+crop+write on an image
+// already sitting on disk. Coordinates are clamped to the source image
+// bounds in case a window is partially off-screen.
+//
+// Both files are always our own P6 PPMs (see save_ppm), so — same idea as
+// composite_desktop_screenshot below — we parse and blit them directly
+// instead of going through ImageMagick's decode/encode pipeline. We also
+// fseek() past the rows above the crop region instead of reading and
+// discarding them, since a crop only ever needs a horizontal band of the
+// source.
 static bool crop_window_screenshot(const std::string &desktop_ppm,
                                    int x, int y, int w, int h,
                                    const std::string &out_path) {
     if (w <= 0 || h <= 0) return false;
 
-    MagickWand *wand = NewMagickWand();
-    bool ok = false;
+    FILE *f = fopen(desktop_ppm.c_str(), "rb");
+    if (!f) return false;
 
-    if (MagickReadImage(wand, desktop_ppm.c_str()) == MagickTrue) {
-        long iw = (long)MagickGetImageWidth(wand);
-        long ih = (long)MagickGetImageHeight(wand);
-
-        long cx = x, cy = y, cw = w, ch = h;
-        if (cx < 0) { cw += cx; cx = 0; }
-        if (cy < 0) { ch += cy; cy = 0; }
-        if (cx + cw > iw) cw = iw - cx;
-        if (cy + ch > ih) ch = ih - cy;
-
-        if (cw > 0 && ch > 0 &&
-            MagickCropImage(wand, (size_t)cw, (size_t)ch, cx, cy) == MagickTrue &&
-            MagickWriteImage(wand, out_path.c_str()) == MagickTrue) {
-            ok = true;
-        }
+    char magic[3] = {};
+    if (fscanf(f, "%2s", magic) != 1 || strcmp(magic, "P6") != 0) {
+        fclose(f);
+        return false;
     }
 
-    wand = DestroyMagickWand(wand);
-    return ok;
+    auto skip_comments = [&]() {
+        int c;
+        while ((c = fgetc(f)) != EOF) {
+            if (isspace(c)) continue;
+            if (c == '#') {
+                while ((c = fgetc(f)) != EOF && c != '\n') ;
+                continue;
+            }
+            ungetc(c, f);
+            break;
+        }
+    };
+
+    int iw = 0, ih = 0, maxval = 0;
+    skip_comments();
+    if (fscanf(f, "%d", &iw) != 1) { fclose(f); return false; }
+    skip_comments();
+    if (fscanf(f, "%d", &ih) != 1) { fclose(f); return false; }
+    skip_comments();
+    if (fscanf(f, "%d", &maxval) != 1) { fclose(f); return false; }
+    if (iw <= 0 || ih <= 0 || maxval != 255) { fclose(f); return false; }
+    fgetc(f);  // consume the single whitespace byte after maxval
+
+    // Clamp the crop rect to the source image bounds.
+    long cx = x, cy = y, cw = w, ch = h;
+    if (cx < 0) { cw += cx; cx = 0; }
+    if (cy < 0) { ch += cy; cy = 0; }
+    if (cx + cw > iw) cw = iw - cx;
+    if (cy + ch > ih) ch = ih - cy;
+    if (cw <= 0 || ch <= 0) { fclose(f); return false; }
+
+    const long header_end = ftell(f);
+    const size_t src_row_bytes = (size_t)iw * 3;
+    const size_t dst_row_bytes = (size_t)cw * 3;
+
+    if (header_end < 0 ||
+        fseek(f, header_end + cy * (long)src_row_bytes, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    std::vector<unsigned char> out_buf((size_t)ch * dst_row_bytes);
+    std::vector<unsigned char> row(src_row_bytes);
+
+    bool ok = true;
+    for (long ry = 0; ry < ch; ++ry) {
+        if (fread(row.data(), 1, src_row_bytes, f) != src_row_bytes) {
+            ok = false;
+            break;
+        }
+        memcpy(out_buf.data() + (size_t)ry * dst_row_bytes,
+               row.data() + (size_t)cx * 3, dst_row_bytes);
+    }
+    fclose(f);
+    if (!ok) return false;
+
+    FILE *out = fopen(out_path.c_str(), "wb");
+    if (!out) return false;
+    fprintf(out, "P6\n%ld %ld\n255\n", cw, ch);
+    const bool write_ok =
+        fwrite(out_buf.data(), 1, out_buf.size(), out) == out_buf.size();
+    fclose(out);
+    return write_ok;
 }
 
 // Recreate a desktop's screenshot from its windows' persisted crops. Desktop
@@ -936,63 +992,11 @@ static bool crop_window_screenshot(const std::string &desktop_ppm,
 // the window ids currently on that desktop (queried live), and each
 // window's own image/geometry is looked up by its immutable id. The result
 // is always consistent with the current desktop layout, never stale.
-/* static bool composite_desktop_screenshot_bak(const std::vector<Window> &ids,
-                                         const std::string &out_path) {
-    struct Placed { Window id; WinMeta m; };
-    std::vector<Placed> placed;
-
-    int canvas_w = 0, canvas_h = 0;
-    for (Window id : ids) {
-        WinMeta m;
-        if (!read_window_meta(id, m)) continue;
-        struct stat st;
-        if (stat(window_screenshot_path(id).c_str(), &st) != 0) continue;
-        placed.push_back({ id, m });
-        canvas_w = std::max(canvas_w, m.x + m.w);
-        canvas_h = std::max(canvas_h, m.y + m.h);
-    }
-    if (placed.empty()) return false;
-
-    PixelWand *bg = NewPixelWand();
-    PixelSetColor(bg, "gray20");
-
-    MagickWand *canvas = NewMagickWand();
-    bool ok = false;
-
-    if (MagickNewImage(canvas, (size_t)canvas_w, (size_t)canvas_h, bg) == MagickTrue) {
-        bool placed_any = false;
-        for (const auto &p : placed) {
-            MagickWand *win = NewMagickWand();
-            bool read_ok = MagickReadImage(win, window_screenshot_path(p.id).c_str()) == MagickTrue;
-#if XGDS_IM7
-            bool composited = read_ok &&
-                MagickCompositeImage(canvas, win, OverCompositeOp, MagickTrue,
-                                     p.m.x, p.m.y) == MagickTrue;
-#else
-            bool composited = read_ok &&
-                MagickCompositeImage(canvas, win, OverCompositeOp,
-                                     p.m.x, p.m.y) == MagickTrue;
-#endif
-            if (composited) {
-                placed_any = true;
-            }
-            win = DestroyMagickWand(win);
-        }
-        ok = placed_any && (MagickWriteImage(canvas, out_path.c_str()) == MagickTrue);
-    }
-
-    canvas = DestroyMagickWand(canvas);
-    bg = DestroyPixelWand(bg);
-    return ok;
-}*/
-
-// Recreate a desktop's screenshot from its windows' persisted crops. Desktop
-// *numbers* get renumbered by the WM whenever a desktop is inserted or
-// removed, so nothing here is keyed by desktop index — the caller passes in
-// the window ids currently on that desktop (queried live), and each
-// window's own image/geometry is looked up by its immutable id. The result
-// is always consistent with the current desktop layout, never stale.
-// Note that the below is an optimized version of the above, pure ppm.
+//
+// Both this function and crop_window_screenshot() above work on our own P6
+// PPMs directly (parse header, blit rows, write header+bytes) rather than
+// going through ImageMagick — avoids the library's decode/encode overhead
+// and per-call setup cost for a format we fully control on both ends.
 static bool composite_desktop_screenshot(const std::vector<Window> &ids,
                                          const std::string &out_path) {
     struct Placed {
@@ -1510,8 +1514,8 @@ static int run_daemon() {
 
     // Background thread that crops individual windows out of the desktop
     // screenshots asynchronously (see enqueue_crop_jobs/crop_worker). It
-    // only touches files via MagickWand, never X, so it's safe to run
-    // alongside the X11 event loop below without any Xlib locking.
+    // only touches plain files (raw PPM read/write), never X, so it's safe
+    // to run alongside the X11 event loop below without any Xlib locking.
     std::thread worker(crop_worker);
 
     printf(NAME " daemon: ready — listening on %s\n", sock_path.c_str());
@@ -1731,7 +1735,6 @@ int run_picker(PickerMode mode) {
         // desktop's screenshot from the windows' own (id-keyed, therefore
         // renumbering-proof) persisted crops.
         auto desk_windows = getDesktopWindowIds(dpy, atoms);
-        MagickWandGenesis();
         for (const auto &[idx, d] : desks) {
             if (d.empty()) continue;
 
@@ -1749,7 +1752,6 @@ int run_picker(PickerMode mode) {
             oss << ">>j {\"name\":\"" << label
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
-        MagickWandTerminus();
         if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
             oss << ">>j {\"name\":\"New\","
                 "\"icon\":\"window-new-symbolic\",\"icon-size\":64}\n";

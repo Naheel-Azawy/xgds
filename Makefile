@@ -2,8 +2,7 @@ PREFIX    = /usr/local
 BINPREFIX = $(DESTDIR)$(PREFIX)/bin
 CXX       = g++
 CXXFLAGS  = -Wall -Wextra
-CXXLIBS   = $$(pkg-config --cflags --libs MagickWand) \
-			-lX11 -lXext -lXrandr
+CXXLIBS   = -lX11 -lXext -lXrandr
 
 xgds: xgds.cpp
 	$(CXX) -o xgds xgds.cpp $(CXXLIBS) $(CXXFLAGS)
