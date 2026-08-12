@@ -594,6 +594,26 @@ static bool moveFocusedWindowAndSwitch(Display *dpy, long desktop, const Atoms& 
     return switchDesktop(dpy, desktop, atoms);
 }
 
+// Return the currently-focused window per _NET_ACTIVE_WINDOW, or None if
+// unavailable (no WM support, or nothing focused).
+static Window getActiveWindow(Display* dpy, const Atoms& atoms) {
+    Window root = DefaultRootWindow(dpy);
+
+    Atom actualType;
+    int actualFormat;
+    unsigned long nitems, bytesAfter;
+    unsigned char* data = nullptr;
+
+    if (XGetWindowProperty(dpy, root, atoms.netActiveWindow, 0, 1, False,
+                           XA_WINDOW, &actualType, &actualFormat,
+                           &nitems, &bytesAfter, &data) != Success || !data)
+        return None;
+
+    Window win = *reinterpret_cast<Window*>(data);
+    XFree(data);
+    return win;
+}
+
 // Activate a specific window (switch to its desktop and raise/focus it),
 // per the EWMH _NET_ACTIVE_WINDOW client message convention.
 static bool switchWindow(Display *dpy, Window win, const Atoms& atoms) {
@@ -1537,8 +1557,6 @@ static int runPicker(PickerMode mode) {
         fprintf(stderr, NAME
                 ": screenshot failed — menu may show stale thumbnails\n");
 
-    bool move_mode = (mode == PICK_MOVE);
-
     auto cmd_change     = envCmd(NAME_UPPER "_CHANGE_CMD");
     auto cmd_move       = envCmd(NAME_UPPER "_MOVE_CMD");
     auto cmd_change_new = envCmd(NAME_UPPER "_CHANGE_NEW_CMD");
@@ -1546,12 +1564,15 @@ static int runPicker(PickerMode mode) {
 
     const Atoms atoms = initAtoms(dpy);
 
-    int focused_idx = getCurrentDesktopIndex(dpy, atoms);
     auto desks = getDesktopsWindowTitles(dpy, atoms);
 
-    // Only populated for PICK_WINDOW — pairs of (window id, title).
-    auto winlist = (mode == PICK_WINDOW) ? getWindowList(dpy, atoms)
-                                          : std::vector<std::pair<Window, std::string>>{};
+    // focused_idx is the index gmenu should pre-select. Its meaning depends
+    // on the picker mode: for PICK_SWITCH/PICK_MOVE it's the current
+    // desktop's index (into `desks`), but for PICK_WINDOW gmenu is showing
+    // one row per *window*, so it must instead be the position of the
+    // currently-focused window within `winlist` — reusing the desktop index
+    // there would highlight an unrelated row.
+    int focused_idx = 0;
 
     // Build the gmenu item list in memory (same format as before)
     std::ostringstream oss;
@@ -1560,7 +1581,13 @@ static int runPicker(PickerMode mode) {
         // use whatever's on disk already (falling back to the generic
         // "window" icon if a crop hasn't landed yet, e.g. right after the
         // very first screenshot before the worker catches up).
-        for (const auto &[win, title] : winlist) {
+        auto winlist = getWindowList(dpy, atoms);
+        Window active = getActiveWindow(dpy, atoms);
+        for (size_t i = 0; i < winlist.size(); ++i) {
+            const auto &[win, title] = winlist[i];
+            if (win == active)
+                focused_idx = (int)i;
+
             const std::string ppm = windowScreenshotPath(win);
             struct stat st;
             const std::string icon =
@@ -1573,6 +1600,7 @@ static int runPicker(PickerMode mode) {
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
     } else {
+        focused_idx = getCurrentDesktopIndex(dpy, atoms);
         // Desktop numbers can be renumbered by the WM (e.g. inserting a
         // desktop in the middle shifts every later one), so we never trust
         // any previously-captured desktop screenshot here. Instead, query
@@ -1610,7 +1638,7 @@ static int runPicker(PickerMode mode) {
         return 1;
     }
 
-    const char* prompt = move_mode ? "Move window to workspace…" :
+    const char* prompt = mode == PICK_MOVE ? "Move window to workspace…" :
                          mode == PICK_WINDOW ? "Switch window…" : "Workspaces";
 
     // Build argv for gmenu — no shell, no quoting worries
@@ -1700,7 +1728,7 @@ static int runPicker(PickerMode mode) {
 
     if (!cmd_change.empty() || !cmd_move.empty() ||
         !cmd_change_new.empty() || !cmd_move_new.empty()) {
-        if (move_mode) {
+        if (mode == PICK_MOVE) {
             if (is_new) {
                 if (!spawnCmd(cmd_move_new)) {
                     fprintf(stderr, NAME ": "
@@ -1744,7 +1772,7 @@ static int runPicker(PickerMode mode) {
             return 1;
         }
 
-        if (move_mode) {
+        if (mode == PICK_MOVE) {
             moveFocusedWindowAndSwitch(dpy, choice_idx, atoms);
         } else {
             switchDesktop(dpy, choice_idx, atoms);
