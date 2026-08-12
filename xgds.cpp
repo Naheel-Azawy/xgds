@@ -236,89 +236,6 @@ static Atoms init_atoms(Display* dpy) {
 // X11 helpers
 // ============================================================
 
-static std::map<long, std::string> getDesktopNames(Display* dpy, const Atoms& atoms) {
-    std::map<long, std::string> out;
-    if (!dpy) return out;
-
-    Window root = DefaultRootWindow(dpy);
-
-    // Get number of desktops
-    long num_desktops = 0;
-
-    {
-        Atom actualType;
-        int actualFormat;
-        unsigned long nItems;
-        unsigned long bytesAfter;
-        unsigned char* data = nullptr;
-
-        if (XGetWindowProperty(dpy, root, atoms.net_number_of_desktops,
-                               0, 1,
-                               False,
-                               XA_CARDINAL,
-                               &actualType,
-                               &actualFormat,
-                               &nItems,
-                               &bytesAfter,
-                               &data) == Success && data) {
-            if (nItems > 0)
-                num_desktops = *reinterpret_cast<unsigned long*>(data);
-            XFree(data);
-        }
-    }
-
-    if (num_desktops <= 0)
-        return out;
-
-    // Get desktop names (null-separated UTF-8 string)
-    Atom actualType;
-    int actualFormat;
-    unsigned long nItems;
-    unsigned long bytesAfter;
-    unsigned char* data = nullptr;
-
-    std::string names_blob;
-
-    if (XGetWindowProperty(dpy, root, atoms.net_desktop_names,
-                           0, (~0L),
-                           False,
-                           atoms.utf8_string,
-                           &actualType,
-                           &actualFormat,
-                           &nItems,
-                           &bytesAfter,
-                           &data) == Success && data)
-        {
-            names_blob.assign(reinterpret_cast<char*>(data), nItems);
-            XFree(data);
-        }
-
-    std::vector<std::string> names;
-    std::string current;
-
-    for (char c : names_blob) {
-        if (c == '\0') {
-            names.push_back(current);
-            current.clear();
-        } else {
-            current.push_back(c);
-        }
-    }
-
-    if (!current.empty())
-        names.push_back(current);
-
-    // Map indices
-    for (long i = 0; i < num_desktops; ++i) {
-        if (i < (long)names.size() && !names[i].empty())
-            out[i] = names[i];
-        else
-            out[i] = std::to_string(i);
-    }
-
-    return out;
-}
-
 static int getCurrentDesktopIndex(Display* dpy, const Atoms& atoms) {
     if (!dpy) return -1;
 
@@ -370,7 +287,7 @@ static std::string getWindowTitle(Display* dpy, Window w, const Atoms& atoms) {
     return {};
 }
 
-std::map<long, std::string> getDesktopWindowTitles(Display* dpy, const Atoms& atoms) {
+std::map<long, std::string> getDesktopsWindowTitles(Display* dpy, const Atoms& atoms) {
     std::map<long, std::string> result;
 
     Window root = DefaultRootWindow(dpy);
@@ -452,7 +369,7 @@ std::map<long, std::string> getDesktopWindowTitles(Display* dpy, const Atoms& at
 }
 
 // Enumerate individual windows (in _NET_CLIENT_LIST order) with their titles.
-// Unlike getDesktopWindowTitles(), this keeps each window separate so a
+// Unlike getDesktopsWindowTitles(), this keeps each window separate so a
 // specific one can be targeted for window switching.
 static std::vector<std::pair<Window, std::string>> getWindowList(Display* dpy, const Atoms& atoms) {
     std::vector<std::pair<Window, std::string>> result;
@@ -1032,15 +949,10 @@ static bool composite_desktop_screenshot(const std::vector<Window> &ids,
     if (placed.empty() || canvas_w <= 0 || canvas_h <= 0)
         return false;
 
-    /*
-     * RGB canvas.
-     *
-     * Change these three values to whatever background you want.
-     * Current color is a dark blue/gray.
-     */
-    constexpr unsigned char BG_R = 32;
-    constexpr unsigned char BG_G = 40;
-    constexpr unsigned char BG_B = 56;
+    // RGB canvas; background color
+    constexpr unsigned char BG_R = 0;
+    constexpr unsigned char BG_G = 0;
+    constexpr unsigned char BG_B = 0;
 
     const size_t canvas_stride = static_cast<size_t>(canvas_w) * 3;
     const size_t canvas_size =
@@ -1073,8 +985,6 @@ static bool composite_desktop_screenshot(const std::vector<Window> &ids,
          * P6
          * width height
          * 255
-         *
-         * We parse it rather than using ImageMagick.
          */
         char magic[3] = {};
         if (fscanf(f, "%2s", magic) != 1 ||
@@ -1701,8 +1611,7 @@ int run_picker(PickerMode mode) {
     const Atoms atoms = init_atoms(dpy);
 
     int focused_idx = getCurrentDesktopIndex(dpy, atoms);
-    auto desks = getDesktopNames(dpy, atoms);
-    auto wins  = getDesktopWindowTitles(dpy, atoms);
+    auto desks = getDesktopsWindowTitles(dpy, atoms);
 
     // Only populated for PICK_WINDOW — pairs of (window id, title).
     auto winlist = (mode == PICK_WINDOW) ? getWindowList(dpy, atoms)
@@ -1735,8 +1644,8 @@ int run_picker(PickerMode mode) {
         // desktop's screenshot from the windows' own (id-keyed, therefore
         // renumbering-proof) persisted crops.
         auto desk_windows = getDesktopWindowIds(dpy, atoms);
-        for (const auto &[idx, d] : desks) {
-            if (d.empty()) continue;
+        for (const auto &[idx, line] : desks) {
+            if (line.empty()) continue;
 
             std::string icon = "desktop";
             const auto wit = desk_windows.find(idx);
@@ -1746,10 +1655,7 @@ int run_picker(PickerMode mode) {
                     icon = out;
             }
 
-            const auto it = wins.find(idx);
-            const std::string &label =
-                (it != wins.end() && !it->second.empty()) ? it->second : d;
-            oss << ">>j {\"name\":\"" << label
+            oss << ">>j {\"name\":\"" << line
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
         if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
@@ -1891,8 +1797,8 @@ int run_picker(PickerMode mode) {
 
     } else {
         long choice_idx = -1;
-        for (const auto &[idx, d] : desks) {
-            if (choice_desk == d) {
+        for (const auto &[idx, line] : desks) {
+            if (choice_desk == line) {
                 choice_idx = idx;
                 break;
             }
@@ -1921,12 +1827,12 @@ int run_picker(PickerMode mode) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s daemon       run the screenshot daemon\n"
-            "  %s screenshot   capture the current desktop now\n"
-            "  %s switch       open workspace picker and switch to selection\n"
-            "  %s move         open workspace picker and move focused window\n"
+            "  %s daemon          run the screenshot daemon\n"
+            "  %s screenshot      capture the current desktop now\n"
+            "  %s switch          open workspace picker and switch to selection\n"
+            "  %s move            open workspace picker and move focused window\n"
             "  %s switch-windows  open window picker and switch to selection\n"
-            "  %s ls           list current desktops and windows\n",
+            "  %s ls              list current desktops and windows\n",
             argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
@@ -1951,14 +1857,9 @@ int main(int argc, char **argv) {
     } else if (!strcmp(cmd, "ls")) {
         Display* dpy = XOpenDisplay(nullptr);
         const Atoms atoms = init_atoms(dpy);
-        auto desks = getDesktopNames(dpy, atoms);
-        auto wins = getDesktopWindowTitles(dpy, atoms);
-        for (const auto &[idx, d] : desks) {
-            const auto it = wins.find(idx);
-            if (it != wins.end() && !it->second.empty())
-                printf("%s: %s\n", d.c_str(), it->second.c_str());
-            else
-                printf("%s\n", d.c_str());
+        auto desks = getDesktopsWindowTitles(dpy, atoms);
+        for (const auto &[_, line] : desks) {
+            printf("%s\n", line.c_str());
         }
         XCloseDisplay(dpy);
         return 0;
