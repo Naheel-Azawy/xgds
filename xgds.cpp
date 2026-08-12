@@ -2,8 +2,8 @@
 // Dependencies: X11, XShm, XRandR, gmenu
 //
 // Screenshots are handled as raw P6 PPMs end-to-end (capture, crop,
-// composite) with plain fread/fwrite/memcpy — see save_ppm,
-// crop_window_screenshot, and composite_desktop_screenshot. There is
+// composite) with plain fread/fwrite/memcpy — see savePpm,
+// cropWindowScreenshot, and compositeDesktopScreenshot. There is
 // intentionally no image-library dependency: every file this program reads
 // was written by this program, so there's no format to negotiate.
 
@@ -17,7 +17,6 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dirent.h>
@@ -33,7 +32,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <format>
 #include <vector>
 #include <map>
 #include <queue>
@@ -44,27 +42,19 @@
 #include <atomic>
 #include <algorithm>
 #include <sstream>
-#include <iostream>
 
 #define NAME       "xgds"
 #define NAME_UPPER "XGDS"
 #define GMENU      "gmenu"
 
-static std::string run_dir;
-static std::string sock_path;
+static std::string runDir;
+static std::string sockPath;
 
 // ============================================================
 // Helpers
 // ============================================================
 
-[[maybe_unused]]
-unsigned long millis() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
-}
-
-static const std::string runtime_dir() {
+static const std::string runtimeDir() {
     // XDG_RUNTIME_DIR is guaranteed by systemd/PAM on any modern Linux
     const char* xdg = getenv("XDG_RUNTIME_DIR");
     if (xdg && *xdg) return std::string(xdg);
@@ -72,45 +62,45 @@ static const std::string runtime_dir() {
     return "/run/user/" + std::to_string(getuid());
 }
 
-static void init_paths() {
-    const auto p = runtime_dir();
-    run_dir   = p + "/" NAME;
-    sock_path = p + "/" NAME "/daemon.sock";
+static void initPaths() {
+    const auto p = runtimeDir();
+    runDir   = p + "/" NAME;
+    sockPath = p + "/" NAME "/daemon.sock";
 }
 
-static std::string desktop_screenshot_path(long desk) {
-    return run_dir + "/" + std::to_string(desk) + ".ppm";
+static std::string desktopScreenshotPath(long desk) {
+    return runDir + "/" + std::to_string(desk) + ".ppm";
 }
 
 // Temp file for a single monitor's raw capture, used only as input to the
 // background crop queue (see ScreenshotRef) and deleted once every window
 // crop has consumed it. This must NOT share a name with
-// desktop_screenshot_path(): that path is also written by the picker
-// (composite_desktop_screenshot) as the persistent "current desktop icon"
+// desktopScreenshotPath(): that path is also written by the picker
+// (compositeDesktopScreenshot) as the persistent "current desktop icon"
 // file, and if the two collided, the daemon's worker thread could delete
 // or overwrite the picker's freshly-composited icon out from under it —
 // which is exactly what caused the current desktop to intermittently
 // vanish from `xgds switch`. A monotonic sequence number keeps every
 // capture's filename unique even across rapid back-to-back requests.
-static std::atomic<unsigned long> g_capture_seq{0};
+static std::atomic<unsigned long> g_captureSeq{0};
 
-static std::string raw_capture_path(size_t monitor_index) {
-    return run_dir + "/cap-" + std::to_string(monitor_index) + "-" +
-           std::to_string(g_capture_seq.fetch_add(1)) + ".ppm";
+static std::string rawCapturePath(size_t monitorIndex) {
+    return runDir + "/cap-" + std::to_string(monitorIndex) + "-" +
+           std::to_string(g_captureSeq.fetch_add(1)) + ".ppm";
 }
 
-static std::string window_screenshot_path(Window w) {
-    return run_dir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
+static std::string windowScreenshotPath(Window w) {
+    return runDir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
 }
 
-static void ensure_dir(const char *path) {
+static void ensureDir(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) return;
     if (mkdir(path, 0755) != 0 && errno != EEXIST)
         fprintf(stderr, NAME ": mkdir(%s): %s\n", path, strerror(errno));
 }
 
-static void clear_dir(const char *path) {
+static void clearDir(const char *path) {
     DIR *dir = opendir(path);
     if (!dir) return;
 
@@ -131,7 +121,7 @@ static void chomp(std::string &s) {
 }
 
 // Read all of fd until EOF into a string.
-static std::string read_fd(int fd) {
+static std::string readFd(int fd) {
     std::string out;
     char buf[512];
     ssize_t n;
@@ -142,7 +132,7 @@ static std::string read_fd(int fd) {
 
 // Read an env var like "cmd arg1 arg2" and split on spaces into a vector.
 // Returns empty vector if the var is unset or empty.
-static std::vector<std::string> env_cmd(const char* var) {
+static std::vector<std::string> envCmd(const char* var) {
     const char* val = getenv(var);
     if (!val || !*val) return {};
     std::vector<std::string> parts;
@@ -155,7 +145,7 @@ static std::vector<std::string> env_cmd(const char* var) {
 
 // Build a null-terminated argv from a vector of strings, optionally appending
 // one extra argument (e.g. the desktop id). The strings must outlive the array.
-static std::vector<char*> make_argv(std::vector<std::string>& parts,
+static std::vector<char*> makeArgv(std::vector<std::string>& parts,
                                     const char* extra = nullptr) {
     std::vector<char*> argv;
     argv.reserve(parts.size() + 2);
@@ -169,10 +159,10 @@ static std::vector<char*> make_argv(std::vector<std::string>& parts,
 
 // Spawn a command from a pre-split vector and optionally an extra arg.
 // Returns false if the vector is empty or the spawn fails.
-static bool spawn_cmd(std::vector<std::string>& parts,
+static bool spawnCmd(std::vector<std::string>& parts,
                       const char* extra = nullptr) {
     if (parts.empty()) return false;
-    auto argv = make_argv(parts, extra);
+    auto argv = makeArgv(parts, extra);
     pid_t pid;
     if (posix_spawnp(&pid, parts[0].c_str(), nullptr, nullptr,
                      argv.data(), environ) != 0) {
@@ -194,7 +184,7 @@ static bool spawn_cmd(std::vector<std::string>& parts,
 // legitimately disappear out from under us — that's not a bug, it's a
 // race against the rest of the desktop. Log and continue instead of
 // crashing the whole picker over one stale window.
-static int xerror_handler(Display *dpy, XErrorEvent *ev) {
+static int xErrorHandler(Display *dpy, XErrorEvent *ev) {
     static char buf[128];
     XGetErrorText(dpy, ev->error_code, buf, sizeof(buf));
     // fprintf(stderr, NAME ": X error ignored: %s (request %d.%d, resource 0x%lx)\n",
@@ -207,28 +197,26 @@ static int xerror_handler(Display *dpy, XErrorEvent *ev) {
 // ============================================================
 
 struct Atoms {
-    Atom net_number_of_desktops;
-    Atom net_current_desktop;
-    Atom net_desktop_names;
-    Atom net_desktop_viewport;
-    Atom net_client_list;
-    Atom net_wm_desktop;
-    Atom net_wm_name;
-    Atom net_active_window;
-    Atom utf8_string;
+    Atom netNumberOfDesktops;
+    Atom netCurrentDesktop;
+    Atom netDesktopViewport;
+    Atom netClientList;
+    Atom netWmDesktop;
+    Atom netWmName;
+    Atom netActiveWindow;
+    Atom utf8String;
 };
 
-static Atoms init_atoms(Display* dpy) {
+static Atoms initAtoms(Display* dpy) {
     Atoms a;
-    a.net_number_of_desktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
-    a.net_current_desktop    = XInternAtom(dpy, "_NET_CURRENT_DESKTOP",    False);
-    a.net_desktop_names      = XInternAtom(dpy, "_NET_DESKTOP_NAMES",      False);
-    a.net_desktop_viewport   = XInternAtom(dpy, "_NET_DESKTOP_VIEWPORT",   False);
-    a.net_client_list        = XInternAtom(dpy, "_NET_CLIENT_LIST",        False);
-    a.net_wm_desktop         = XInternAtom(dpy, "_NET_WM_DESKTOP",         False);
-    a.net_wm_name            = XInternAtom(dpy, "_NET_WM_NAME",            False);
-    a.net_active_window      = XInternAtom(dpy, "_NET_ACTIVE_WINDOW",      False);
-    a.utf8_string            = XInternAtom(dpy, "UTF8_STRING",             False);
+    a.netNumberOfDesktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+    a.netCurrentDesktop   = XInternAtom(dpy, "_NET_CURRENT_DESKTOP",    False);
+    a.netDesktopViewport  = XInternAtom(dpy, "_NET_DESKTOP_VIEWPORT",   False);
+    a.netClientList       = XInternAtom(dpy, "_NET_CLIENT_LIST",        False);
+    a.netWmDesktop        = XInternAtom(dpy, "_NET_WM_DESKTOP",         False);
+    a.netWmName           = XInternAtom(dpy, "_NET_WM_NAME",            False);
+    a.netActiveWindow     = XInternAtom(dpy, "_NET_ACTIVE_WINDOW",      False);
+    a.utf8String          = XInternAtom(dpy, "UTF8_STRING",             False);
     return a;
 }
 
@@ -246,7 +234,7 @@ static int getCurrentDesktopIndex(Display* dpy, const Atoms& atoms) {
     unsigned long nitems, bytesAfter;
     unsigned char* data = nullptr;
 
-    if (XGetWindowProperty(dpy, root, atoms.net_current_desktop,
+    if (XGetWindowProperty(dpy, root, atoms.netCurrentDesktop,
                            0, 1, False, XA_CARDINAL,
                            &type, &format, &nitems,
                            &bytesAfter, &data) != Success || !data)
@@ -264,8 +252,8 @@ static std::string getWindowTitle(Display* dpy, Window w, const Atoms& atoms) {
     unsigned char* prop = nullptr;
 
     // _NET_WM_NAME (UTF-8)
-    if (XGetWindowProperty(dpy, w, atoms.net_wm_name,
-                           0, (~0L), False, atoms.utf8_string,
+    if (XGetWindowProperty(dpy, w, atoms.netWmName,
+                           0, (~0L), False, atoms.utf8String,
                            &actualType, &actualFormat,
                            &nItems, &bytesAfter,
                            &prop) == Success && prop) {
@@ -287,7 +275,7 @@ static std::string getWindowTitle(Display* dpy, Window w, const Atoms& atoms) {
     return {};
 }
 
-std::map<long, std::string> getDesktopsWindowTitles(Display* dpy, const Atoms& atoms) {
+static std::map<long, std::string> getDesktopsWindowTitles(Display* dpy, const Atoms& atoms) {
     std::map<long, std::string> result;
 
     Window root = DefaultRootWindow(dpy);
@@ -299,7 +287,7 @@ std::map<long, std::string> getDesktopsWindowTitles(Display* dpy, const Atoms& a
 
     if (XGetWindowProperty(dpy,
                            root,
-                           atoms.net_client_list,
+                           atoms.netClientList,
                            0,
                            (~0L),
                            False,
@@ -327,7 +315,7 @@ std::map<long, std::string> getDesktopsWindowTitles(Display* dpy, const Atoms& a
 
         if (XGetWindowProperty(dpy,
                                w,
-                               atoms.net_wm_desktop,
+                               atoms.netWmDesktop,
                                0,
                                1,
                                False,
@@ -381,7 +369,7 @@ static std::vector<std::pair<Window, std::string>> getWindowList(Display* dpy, c
     unsigned long nitems, bytesAfter;
     unsigned char* data = nullptr;
 
-    if (XGetWindowProperty(dpy, root, atoms.net_client_list, 0, (~0L), False,
+    if (XGetWindowProperty(dpy, root, atoms.netClientList, 0, (~0L), False,
                            XA_WINDOW, &actualType, &actualFormat,
                            &nitems, &bytesAfter, &data) != Success || !data)
         return result;
@@ -432,7 +420,7 @@ static std::vector<WinGeom> getAllWindowGeometries(Display* dpy, const Atoms& at
     unsigned long nitems, bytesAfter;
     unsigned char* data = nullptr;
 
-    if (XGetWindowProperty(dpy, root, atoms.net_client_list, 0, (~0L), False,
+    if (XGetWindowProperty(dpy, root, atoms.netClientList, 0, (~0L), False,
                            XA_WINDOW, &actualType, &actualFormat,
                            &nitems, &bytesAfter, &data) != Success || !data)
         return result;
@@ -445,7 +433,7 @@ static std::vector<WinGeom> getAllWindowGeometries(Display* dpy, const Atoms& at
         unsigned long deskItems;
         long desktop = -1;
 
-        if (XGetWindowProperty(dpy, w, atoms.net_wm_desktop, 0, 1, False,
+        if (XGetWindowProperty(dpy, w, atoms.netWmDesktop, 0, 1, False,
                                XA_CARDINAL, &actualType, &actualFormat,
                                &deskItems, &bytesAfter, &deskData) == Success
             && deskData) {
@@ -483,7 +471,7 @@ static std::map<long, std::vector<Window>> getDesktopWindowIds(Display* dpy, con
     unsigned long nitems, bytesAfter;
     unsigned char* data = nullptr;
 
-    if (XGetWindowProperty(dpy, root, atoms.net_client_list, 0, (~0L), False,
+    if (XGetWindowProperty(dpy, root, atoms.netClientList, 0, (~0L), False,
                            XA_WINDOW, &actualType, &actualFormat,
                            &nitems, &bytesAfter, &data) != Success || !data)
         return result;
@@ -495,7 +483,7 @@ static std::map<long, std::vector<Window>> getDesktopWindowIds(Display* dpy, con
         unsigned char* deskData = nullptr;
         unsigned long deskItems;
 
-        if (XGetWindowProperty(dpy, w, atoms.net_wm_desktop, 0, 1, False,
+        if (XGetWindowProperty(dpy, w, atoms.netWmDesktop, 0, 1, False,
                                XA_CARDINAL, &actualType, &actualFormat,
                                &deskItems, &bytesAfter, &deskData) != Success
             || !deskData)
@@ -511,12 +499,12 @@ static std::map<long, std::vector<Window>> getDesktopWindowIds(Display* dpy, con
     return result;
 }
 
-static std::string window_meta_path(Window w) {
-    return run_dir + "/win-" + std::to_string((unsigned long)w) + ".meta";
+static std::string windowMetaPath(Window w) {
+    return runDir + "/win-" + std::to_string((unsigned long)w) + ".meta";
 }
 
-static void write_window_meta(Window w, int x, int y, int width, int height) {
-    const std::string path = window_meta_path(w);
+static void writeWindowMeta(Window w, int x, int y, int width, int height) {
+    const std::string path = windowMetaPath(w);
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) {
         fprintf(stderr, NAME ": fopen(%s): %s\n", path.c_str(), strerror(errno));
@@ -526,8 +514,8 @@ static void write_window_meta(Window w, int x, int y, int width, int height) {
     fclose(fp);
 }
 
-static bool read_window_meta(Window w, WinMeta &out) {
-    const std::string path = window_meta_path(w);
+static bool readWindowMeta(Window w, WinMeta &out) {
+    const std::string path = windowMetaPath(w);
     FILE* fp = fopen(path.c_str(), "r");
     if (!fp) return false;
     bool ok = fscanf(fp, "%d %d %d %d", &out.x, &out.y, &out.w, &out.h) == 4;
@@ -541,7 +529,7 @@ static bool switchDesktop(Display *dpy, long desktop, const Atoms& atoms) {
     XEvent ev{};
     ev.xclient.type = ClientMessage;
     ev.xclient.window = root;
-    ev.xclient.message_type = atoms.net_current_desktop;
+    ev.xclient.message_type = atoms.netCurrentDesktop;
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = desktop;
     ev.xclient.data.l[1] = CurrentTime;
@@ -566,7 +554,7 @@ static bool moveFocusedWindowToDesktop(Display *dpy, long desktop, const Atoms& 
 
     if (XGetWindowProperty(dpy,
                            root,
-                           atoms.net_active_window,
+                           atoms.netActiveWindow,
                            0,
                            1,
                            False,
@@ -585,7 +573,7 @@ static bool moveFocusedWindowToDesktop(Display *dpy, long desktop, const Atoms& 
     XEvent ev{};
     ev.xclient.type = ClientMessage;
     ev.xclient.window = win;
-    ev.xclient.message_type = atoms.net_wm_desktop;
+    ev.xclient.message_type = atoms.netWmDesktop;
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = desktop;
     ev.xclient.data.l[1] = CurrentTime;
@@ -614,7 +602,7 @@ static bool switchWindow(Display *dpy, Window win, const Atoms& atoms) {
     XEvent ev{};
     ev.xclient.type = ClientMessage;
     ev.xclient.window = win;
-    ev.xclient.message_type = atoms.net_active_window;
+    ev.xclient.message_type = atoms.netActiveWindow;
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = 2; // source indication: pager/task-switcher
     ev.xclient.data.l[1] = CurrentTime;
@@ -636,7 +624,7 @@ struct Monitor {
     std::string name;
 };
 
-static std::vector<Monitor> get_monitors(Display *dpy) {
+static std::vector<Monitor> getMonitors(Display *dpy) {
     std::vector<Monitor> mons;
     int screen = DefaultScreen(dpy);
     Window root = RootWindow(dpy, screen);
@@ -675,56 +663,6 @@ static std::vector<Monitor> get_monitors(Display *dpy) {
 }
 
 // ============================================================
-// Focused-monitor detection
-// ============================================================
-
-[[maybe_unused]]
-static int focused_monitor(Display *dpy, const std::vector<Monitor> &mons, const Atoms& atoms) {
-    if (mons.size() == 1) return 0;
-
-    Window root = DefaultRootWindow(dpy);
-    if (atoms.net_active_window == None) return 0;
-
-    Atom atype; int afmt; unsigned long nitems, after;
-    unsigned char *prop = nullptr;
-    if (XGetWindowProperty(dpy, root, atoms.net_active_window, 0, 1, False, XA_WINDOW,
-                           &atype, &afmt, &nitems, &after, &prop) != Success || !prop)
-        return 0;
-
-    Window active = *(Window *)prop;
-    XFree(prop);
-    if (active == None || active == root) return 0;
-
-    XWindowAttributes wa;
-    if (!XGetWindowAttributes(dpy, active, &wa)) return 0;
-
-    Window child;
-    int wx = wa.x, wy = wa.y;
-    XTranslateCoordinates(dpy, active, root, 0, 0, &wx, &wy, &child);
-
-    int cx = wx + (int)wa.width  / 2;
-    int cy = wy + (int)wa.height / 2;
-
-    for (int i = 0; i < (int)mons.size(); ++i) {
-        const Monitor &m = mons[i];
-        if (cx >= m.x && cx < m.x + m.w && cy >= m.y && cy < m.y + m.h)
-            return i;
-    }
-
-    // Fallback: largest overlap
-    int  best = 0;
-    long best_area = -1;
-    for (int i = 0; i < (int)mons.size(); ++i) {
-        const Monitor &m = mons[i];
-        int ow = std::min(wx + (int)wa.width,  m.x + m.w) - std::max(wx, m.x);
-        int oh = std::min(wy + (int)wa.height, m.y + m.h) - std::max(wy, m.y);
-        long area = (ow > 0 && oh > 0) ? (long)ow * oh : 0;
-        if (area > best_area) { best_area = area; best = i; }
-    }
-    return best;
-}
-
-// ============================================================
 // XShm framebuffer
 // ============================================================
 
@@ -734,7 +672,7 @@ struct ShmImage {
     bool            valid = false;
 };
 
-static bool shm_alloc(Display *dpy, ShmImage &s, int w, int h) {
+static bool shmAlloc(Display *dpy, ShmImage &s, int w, int h) {
     int screen = DefaultScreen(dpy);
     s.img = XShmCreateImage(dpy, DefaultVisual(dpy, screen),
                             DefaultDepth(dpy, screen),
@@ -758,7 +696,7 @@ static bool shm_alloc(Display *dpy, ShmImage &s, int w, int h) {
     return true;
 }
 
-static void shm_free(Display *dpy, ShmImage &s) {
+static void shmFree(Display *dpy, ShmImage &s) {
     if (!s.valid) return;
     XShmDetach(dpy, &s.info);
     shmdt(s.info.shmaddr);
@@ -771,12 +709,12 @@ static void shm_free(Display *dpy, ShmImage &s) {
 // Screenshot + PPM writer
 // ============================================================
 
-static void grab_monitor(Display *dpy, const Monitor &mon, const ShmImage &s) {
+static void grabMonitor(Display *dpy, const Monitor &mon, const ShmImage &s) {
     XShmGetImage(dpy, DefaultRootWindow(dpy), s.img, mon.x, mon.y, AllPlanes);
     XFlush(dpy);
 }
 
-static bool save_ppm(Display *dpy, XImage *img, const char *path) {
+static bool savePpm(Display *dpy, XImage *img, const char *path) {
     FILE *fp = fopen(path, "wb");
     if (!fp) { fprintf(stderr, NAME ": fopen(%s): %s\n", path, strerror(errno)); return false; }
 
@@ -818,13 +756,13 @@ static bool save_ppm(Display *dpy, XImage *img, const char *path) {
 // already sitting on disk. Coordinates are clamped to the source image
 // bounds in case a window is partially off-screen.
 //
-// Both files are always our own P6 PPMs (see save_ppm), so — same idea as
-// composite_desktop_screenshot below — we parse and blit them directly
+// Both files are always our own P6 PPMs (see savePpm), so — same idea as
+// compositeDesktopScreenshot below — we parse and blit them directly
 // instead of going through ImageMagick's decode/encode pipeline. We also
 // fseek() past the rows above the crop region instead of reading and
 // discarding them, since a crop only ever needs a horizontal band of the
 // source.
-static bool crop_window_screenshot(const std::string &desktop_ppm,
+static bool cropWindowScreenshot(const std::string &desktop_ppm,
                                    int x, int y, int w, int h,
                                    const std::string &out_path) {
     if (w <= 0 || h <= 0) return false;
@@ -910,11 +848,11 @@ static bool crop_window_screenshot(const std::string &desktop_ppm,
 // window's own image/geometry is looked up by its immutable id. The result
 // is always consistent with the current desktop layout, never stale.
 //
-// Both this function and crop_window_screenshot() above work on our own P6
+// Both this function and cropWindowScreenshot() above work on our own P6
 // PPMs directly (parse header, blit rows, write header+bytes) rather than
 // going through ImageMagick — avoids the library's decode/encode overhead
 // and per-call setup cost for a format we fully control on both ends.
-static bool composite_desktop_screenshot(const std::vector<Window> &ids,
+static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
                                          const std::string &out_path) {
     struct Placed {
         Window id;
@@ -931,10 +869,10 @@ static bool composite_desktop_screenshot(const std::vector<Window> &ids,
     // First collect valid windows.
     for (Window id : ids) {
         WinMeta m;
-        if (!read_window_meta(id, m))
+        if (!readWindowMeta(id, m))
             continue;
 
-        const std::string path = window_screenshot_path(id);
+        const std::string path = windowScreenshotPath(id);
 
         struct stat st;
         if (stat(path.c_str(), &st) != 0 || st.st_size <= 0)
@@ -1133,40 +1071,40 @@ struct CropJob {
     int x, y, w, h;
 };
 
-static std::mutex              g_crop_mutex;
-static std::condition_variable g_crop_cv;
-static std::queue<CropJob>     g_crop_queue;
-static std::atomic<bool>       g_crop_stop{false};
+static std::mutex              g_cropMutex;
+static std::condition_variable g_cropCv;
+static std::queue<CropJob>     g_cropQueue;
+static std::atomic<bool>       g_cropStop{false};
 
-static void enqueue_crop_jobs(std::vector<CropJob> jobs) {
+static void enqueueCropJobs(std::vector<CropJob> jobs) {
     if (jobs.empty()) return;
     {
-        std::lock_guard<std::mutex> lock(g_crop_mutex);
-        for (auto &j : jobs) g_crop_queue.push(std::move(j));
+        std::lock_guard<std::mutex> lock(g_cropMutex);
+        for (auto &j : jobs) g_cropQueue.push(std::move(j));
     }
-    g_crop_cv.notify_all();
+    g_cropCv.notify_all();
 }
 
-static void crop_worker() {
+static void cropWorker() {
     for (;;) {
         CropJob job;
         {
-            std::unique_lock<std::mutex> lock(g_crop_mutex);
-            g_crop_cv.wait(lock, [] {
-                return !g_crop_queue.empty() || g_crop_stop.load();
+            std::unique_lock<std::mutex> lock(g_cropMutex);
+            g_cropCv.wait(lock, [] {
+                return !g_cropQueue.empty() || g_cropStop.load();
             });
-            if (g_crop_queue.empty()) {
-                if (g_crop_stop.load()) return;
+            if (g_cropQueue.empty()) {
+                if (g_cropStop.load()) return;
                 continue;
             }
-            job = std::move(g_crop_queue.front());
-            g_crop_queue.pop();
+            job = std::move(g_cropQueue.front());
+            g_cropQueue.pop();
         }
 
-        if (crop_window_screenshot(job.screenshot->path, job.x, job.y,
+        if (cropWindowScreenshot(job.screenshot->path, job.x, job.y,
                                    job.w, job.h,
-                                   window_screenshot_path(job.win))) {
-            write_window_meta(job.win, job.x, job.y, job.w, job.h);
+                                   windowScreenshotPath(job.win))) {
+            writeWindowMeta(job.win, job.x, job.y, job.w, job.h);
         }
         // job (and its shared_ptr<ScreenshotRef>) is destroyed here; once
         // every job sharing this screenshot has gone through this path,
@@ -1177,7 +1115,7 @@ static void crop_worker() {
 
 
 // Send the ack reply back through the already-connected client socket.
-static void daemon_send_ack(int client_fd, bool ok) {
+static void daemonSendAck(int client_fd, bool ok) {
     const char *msg = ok ? "ok\n" : "err\n";
     // Best-effort write; if the client disconnected early, ignore the error.
     (void)write(client_fd, msg, strlen(msg));
@@ -1185,15 +1123,15 @@ static void daemon_send_ack(int client_fd, bool ok) {
 
 // Free all SHM buffers and rebuild monitors + SHM from the current RandR state.
 // Returns false if no monitors are found after the refresh.
-static bool rebuild_monitors(Display *dpy,
+static bool rebuildMonitors(Display *dpy,
                              std::vector<Monitor>  &monitors,
                              std::vector<ShmImage> &shms) {
     // Release old SHM buffers.
-    for (auto &s : shms) shm_free(dpy, s);
+    for (auto &s : shms) shmFree(dpy, s);
     shms.clear();
     monitors.clear();
 
-    monitors = get_monitors(dpy);
+    monitors = getMonitors(dpy);
     if (monitors.empty()) {
         fprintf(stderr, NAME ": no connected monitors after hotplug\n");
         return false;
@@ -1209,10 +1147,10 @@ static bool rebuild_monitors(Display *dpy,
 
     shms.resize(monitors.size());
     for (size_t i = 0; i < monitors.size(); ++i) {
-        if (!shm_alloc(dpy, shms[i], monitors[i].w, monitors[i].h)) {
-            fprintf(stderr, NAME ": shm_alloc failed for monitor %zu\n", i);
+        if (!shmAlloc(dpy, shms[i], monitors[i].w, monitors[i].h)) {
+            fprintf(stderr, NAME ": shmAlloc failed for monitor %zu\n", i);
             // Free anything we already allocated before returning.
-            for (size_t j = 0; j < i; ++j) shm_free(dpy, shms[j]);
+            for (size_t j = 0; j < i; ++j) shmFree(dpy, shms[j]);
             shms.clear();
             monitors.clear();
             return false;
@@ -1221,11 +1159,10 @@ static bool rebuild_monitors(Display *dpy,
     return true;
 }
 
-static bool capture_monitor_desktops(Display *dpy,
+static bool captureMonitorDesktops(Display *dpy,
                                      const std::vector<Monitor> &monitors,
                                      const std::vector<ShmImage> &shms,
-                                     const Atoms& atoms,
-                                     bool &saved) {
+                                     const Atoms& atoms) {
     if (monitors.empty()) {
         fprintf(stderr, NAME ": screenshot skipped — no monitors available\n");
         return false;
@@ -1254,7 +1191,7 @@ static bool capture_monitor_desktops(Display *dpy,
     };
 
     // Total number of desktops.
-    long num_desktops = read_cardinal(atoms.net_number_of_desktops, 1);
+    long num_desktops = read_cardinal(atoms.netNumberOfDesktops, 1);
 
     // For each monitor, find which desktop is currently visible on
     // it by matching the desktop's viewport origin to the monitor
@@ -1264,7 +1201,7 @@ static bool capture_monitor_desktops(Display *dpy,
     // Fallback: if no desktop maps to a monitor (e.g. the WM uses a
     // single shared viewport), use _NET_CURRENT_DESKTOP for every
     // monitor so we at least capture something useful.
-    long current_desk = read_cardinal(atoms.net_current_desktop, -1);
+    long current_desk = read_cardinal(atoms.netCurrentDesktop, -1);
     long current_mon = -1;
     if (current_desk < 0) {
         fprintf(stderr, NAME ": screenshot skipped - current desktop not found\n");
@@ -1277,7 +1214,7 @@ static bool capture_monitor_desktops(Display *dpy,
     // per-monitor workspaces) the viewport origin equals the
     // monitor's top-left corner.
     std::vector<std::pair<long, long>> viewport(num_desktops, {-1, -1});
-    if (XGetWindowProperty(dpy, root, atoms.net_desktop_viewport, 0,
+    if (XGetWindowProperty(dpy, root, atoms.netDesktopViewport, 0,
                            num_desktops * 2, False, XA_CARDINAL,
                            &atype, &afmt, &nitems, &after, &data) == Success
         && data) {
@@ -1332,9 +1269,9 @@ static bool capture_monitor_desktops(Display *dpy,
     for (size_t mi = 0; mi < monitors.size(); ++mi) {
         long desk = ((long)mi == current_mon) ?
             current_desk : mon_desk[mi];
-        grab_monitor(dpy, monitors[mi], shms[mi]);
-        std::string path = raw_capture_path(mi);
-        if (!save_ppm(dpy, shms[mi].img, path.c_str()))
+        grabMonitor(dpy, monitors[mi], shms[mi]);
+        std::string path = rawCapturePath(mi);
+        if (!savePpm(dpy, shms[mi].img, path.c_str()))
             continue;
         ++saved_count;
 
@@ -1352,14 +1289,13 @@ static bool capture_monitor_desktops(Display *dpy,
                              g.x - monitors[mi].x, g.y - monitors[mi].y,
                              g.w, g.h });
         }
-        enqueue_crop_jobs(std::move(jobs));
+        enqueueCropJobs(std::move(jobs));
     }
 
-    saved = (saved_count > 0);
-    return saved;
+    return saved_count > 0;
 }
 
-static int run_daemon() {
+static int runDaemon() {
     Display *dpy = XOpenDisplay(nullptr);
     if (!dpy) {
         fprintf(stderr, NAME ": cannot open display\n");
@@ -1378,11 +1314,11 @@ static int run_daemon() {
         XRRSelectInput(dpy, root, RROutputChangeNotifyMask | RRScreenChangeNotifyMask);
     }
 
-    clear_dir(run_dir.c_str());
-    ensure_dir(run_dir.c_str());
+    clearDir(runDir.c_str());
+    ensureDir(runDir.c_str());
 
     // Remove any stale socket from a previous run.
-    unlink(sock_path.c_str());
+    unlink(sockPath.c_str());
 
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) { perror(NAME ": socket"); return 1; }
@@ -1399,12 +1335,12 @@ static int run_daemon() {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror(NAME ": bind"); close(srv); return 1;
     }
-    chmod(sock_path.c_str(), 0600);
+    chmod(sockPath.c_str(), 0600);
 
     if (listen(srv, /*backlog=*/8) != 0) {
         perror(NAME ": listen"); close(srv); return 1;
@@ -1413,22 +1349,22 @@ static int run_daemon() {
     std::vector<Monitor> monitors;
     std::vector<ShmImage> shms;
 
-    if (!rebuild_monitors(dpy, monitors, shms)) {
+    if (!rebuildMonitors(dpy, monitors, shms)) {
         fprintf(stderr, NAME ": no connected monitors\n");
         close(srv); return 1;
     }
 
     // Cache all needed atoms once — XInternAtom round-trips are cheap
     // but there is no reason to repeat them on every screenshot request.
-    const Atoms atoms = init_atoms(dpy);
+    const Atoms atoms = initAtoms(dpy);
 
     // Background thread that crops individual windows out of the desktop
-    // screenshots asynchronously (see enqueue_crop_jobs/crop_worker). It
+    // screenshots asynchronously (see enqueueCropJobs/cropWorker). It
     // only touches plain files (raw PPM read/write), never X, so it's safe
     // to run alongside the X11 event loop below without any Xlib locking.
-    std::thread worker(crop_worker);
+    std::thread worker(cropWorker);
 
-    printf(NAME " daemon: ready — listening on %s\n", sock_path.c_str());
+    printf(NAME " daemon: ready — listening on %s\n", sockPath.c_str());
     fflush(stdout);
 
     int x11_fd = ConnectionNumber(dpy);
@@ -1447,7 +1383,7 @@ static int run_daemon() {
                 XRRUpdateConfiguration(&ev);
                 printf(NAME ": RandR screen change — rebuilding monitors\n");
                 fflush(stdout);
-                rebuild_monitors(dpy, monitors, shms);
+                rebuildMonitors(dpy, monitors, shms);
                 continue;
             }
 
@@ -1457,7 +1393,7 @@ static int run_daemon() {
                 if (rrev->subtype == RRNotify_OutputChange) {
                     printf(NAME ": RandR output change — rebuilding monitors\n");
                     fflush(stdout);
-                    rebuild_monitors(dpy, monitors, shms);
+                    rebuildMonitors(dpy, monitors, shms);
                 }
                 continue;
             }
@@ -1498,24 +1434,24 @@ static int run_daemon() {
                 bool saved = false;
 
                 if (token == 's') {
-                    saved = capture_monitor_desktops(dpy, monitors, shms, atoms, saved);
+                    saved = captureMonitorDesktops(dpy, monitors, shms, atoms);
                 }
 
                 // Reply goes back through the same connection — no race possible.
-                daemon_send_ack(client_fd, saved);
+                daemonSendAck(client_fd, saved);
                 close(client_fd);
             }
         }
         // X11 activity is handled at the top of the loop via XPending().
     }
 
-    g_crop_stop.store(true);
-    g_crop_cv.notify_all();
+    g_cropStop.store(true);
+    g_cropCv.notify_all();
     worker.join();
 
-    for (auto &s : shms) shm_free(dpy, s);
+    for (auto &s : shms) shmFree(dpy, s);
     close(srv);
-    unlink(sock_path.c_str());
+    unlink(sockPath.c_str());
     XCloseDisplay(dpy);
     return 0;
 }
@@ -1527,21 +1463,21 @@ static int run_daemon() {
 // Check whether the daemon is up by attempting a real connection to its
 // Unix socket.  Using connect() rather than stat() catches stale socket
 // files left by a crashed daemon.
-static bool daemon_running() {
+static bool daemonRunning() {
     // Probe by actually connecting — avoids stale socket files.
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
     bool ok = (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     close(fd);
     return ok;
 }
 
 // Require the daemon; print a helpful message and return false if absent.
-static bool require_daemon() {
-    if (daemon_running()) return true;
+static bool requireDaemon() {
+    if (daemonRunning()) return true;
     fprintf(stderr, NAME ": daemon is not running\n");
     return false;
 }
@@ -1550,13 +1486,13 @@ static bool require_daemon() {
 // the "ok" / "err" reply.  Each call is a fully independent connection, so
 // there is no open-order race and concurrent callers never steal each other's
 // acknowledgement.
-static bool client_screenshot() {
+static bool clientScreenshot() {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { perror(NAME ": socket"); return false; }
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror(NAME ": connect");
@@ -1578,10 +1514,10 @@ static bool client_screenshot() {
     return (n >= 2 && strncmp(buf, "ok", 2) == 0);
 }
 
-// public subcommand wrapping client_screenshot()
-static int run_screenshot() {
-    if (!require_daemon()) return 1;
-    bool ok = client_screenshot();
+// public subcommand wrapping clientScreenshot()
+static int runScreenshot() {
+    if (!requireDaemon()) return 1;
+    bool ok = clientScreenshot();
     if (!ok) { fprintf(stderr, NAME ": screenshot failed\n"); return 1; }
     return 0;
 }
@@ -1592,23 +1528,23 @@ static int run_screenshot() {
 
 enum PickerMode { PICK_SWITCH, PICK_MOVE, PICK_WINDOW };
 
-int run_picker(PickerMode mode) {
-    if (!require_daemon()) return 1;
+static int runPicker(PickerMode mode) {
+    if (!requireDaemon()) return 1;
 
     Display* dpy = XOpenDisplay(nullptr);
 
-    if (!client_screenshot())
+    if (!clientScreenshot())
         fprintf(stderr, NAME
                 ": screenshot failed — menu may show stale thumbnails\n");
 
     bool move_mode = (mode == PICK_MOVE);
 
-    auto cmd_change     = env_cmd(NAME_UPPER "_CHANGE_CMD");
-    auto cmd_move       = env_cmd(NAME_UPPER "_MOVE_CMD");
-    auto cmd_change_new = env_cmd(NAME_UPPER "_CHANGE_NEW_CMD");
-    auto cmd_move_new   = env_cmd(NAME_UPPER "_MOVE_NEW_CMD");
+    auto cmd_change     = envCmd(NAME_UPPER "_CHANGE_CMD");
+    auto cmd_move       = envCmd(NAME_UPPER "_MOVE_CMD");
+    auto cmd_change_new = envCmd(NAME_UPPER "_CHANGE_NEW_CMD");
+    auto cmd_move_new   = envCmd(NAME_UPPER "_MOVE_NEW_CMD");
 
-    const Atoms atoms = init_atoms(dpy);
+    const Atoms atoms = initAtoms(dpy);
 
     int focused_idx = getCurrentDesktopIndex(dpy, atoms);
     auto desks = getDesktopsWindowTitles(dpy, atoms);
@@ -1625,7 +1561,7 @@ int run_picker(PickerMode mode) {
         // "window" icon if a crop hasn't landed yet, e.g. right after the
         // very first screenshot before the worker catches up).
         for (const auto &[win, title] : winlist) {
-            const std::string ppm = window_screenshot_path(win);
+            const std::string ppm = windowScreenshotPath(win);
             struct stat st;
             const std::string icon =
                 (stat(ppm.c_str(), &st) == 0) ? ppm : "window";
@@ -1633,7 +1569,7 @@ int run_picker(PickerMode mode) {
             // Encode the window id as a prefix ("id:title"); the generic
             // colon-split below hands us the id back untouched, so
             // selection never depends on matching title text.
-            oss << ">>j {\"name\":\"" << (unsigned long)win << ":" << title
+            oss << ">>j {\"name\":\"" << (unsigned long)win << ": " << title
                 << "\",\"icon\":\"" << icon << "\"}\n";
         }
     } else {
@@ -1650,8 +1586,8 @@ int run_picker(PickerMode mode) {
             std::string icon = "desktop";
             const auto wit = desk_windows.find(idx);
             if (wit != desk_windows.end() && !wit->second.empty()) {
-                const std::string out = desktop_screenshot_path(idx);
-                if (composite_desktop_screenshot(wit->second, out))
+                const std::string out = desktopScreenshotPath(idx);
+                if (compositeDesktopScreenshot(wit->second, out))
                     icon = out;
             }
 
@@ -1732,7 +1668,7 @@ int run_picker(PickerMode mode) {
     close(in_pipe[1]);   // EOF -> gmenu stops reading and opens its window
 
     // Read gmenu's selection
-    std::string choice = read_fd(out_pipe[0]);
+    std::string choice = readFd(out_pipe[0]);
     close(out_pipe[0]);
 
     // Reap the child
@@ -1766,13 +1702,13 @@ int run_picker(PickerMode mode) {
         !cmd_change_new.empty() || !cmd_move_new.empty()) {
         if (move_mode) {
             if (is_new) {
-                if (!spawn_cmd(cmd_move_new)) {
+                if (!spawnCmd(cmd_move_new)) {
                     fprintf(stderr, NAME ": "
                             NAME "_MOVE_NEW_CMD not set or failed\n");
                     return 1;
                 }
             } else {
-                if (!spawn_cmd(cmd_move, choice_desk.c_str())) {
+                if (!spawnCmd(cmd_move, choice_desk.c_str())) {
                     fprintf(stderr, NAME ": " NAME
                             "_MOVE_CMD not set or failed\n");
                     return 1;
@@ -1781,13 +1717,13 @@ int run_picker(PickerMode mode) {
 
         } else {
             if (is_new) {
-                if (!spawn_cmd(cmd_change_new)) {
+                if (!spawnCmd(cmd_change_new)) {
                     fprintf(stderr, NAME ": " NAME
                             "_CHANGE_NEW_CMD not set or failed\n");
                     return 1;
                 }
             } else {
-                if (!spawn_cmd(cmd_change, choice_desk.c_str())) {
+                if (!spawnCmd(cmd_change, choice_desk.c_str())) {
                     fprintf(stderr, NAME ": " NAME
                             "_CHANGE_CMD not set or failed\n");
                     return 1;
@@ -1841,22 +1777,22 @@ int main(int argc, char **argv) {
 
     const char *cmd = argv[1];
 
-    XSetErrorHandler(xerror_handler);
-    init_paths();
+    XSetErrorHandler(xErrorHandler);
+    initPaths();
 
     if (!strcmp(cmd, "daemon")) {
-        return run_daemon();
+        return runDaemon();
     } else if (!strcmp(cmd, "screenshot")) {
-        return run_screenshot();
+        return runScreenshot();
     } else if (!strcmp(cmd, "switch")) {
-        return run_picker(PICK_SWITCH);
+        return runPicker(PICK_SWITCH);
     } else if (!strcmp(cmd, "move")) {
-        return run_picker(PICK_MOVE);
+        return runPicker(PICK_MOVE);
     } else if (!strcmp(cmd, "switch-windows")) {
-        return run_picker(PICK_WINDOW);
+        return runPicker(PICK_WINDOW);
     } else if (!strcmp(cmd, "ls")) {
         Display* dpy = XOpenDisplay(nullptr);
-        const Atoms atoms = init_atoms(dpy);
+        const Atoms atoms = initAtoms(dpy);
         auto desks = getDesktopsWindowTitles(dpy, atoms);
         for (const auto &[_, line] : desks) {
             printf("%s\n", line.c_str());
