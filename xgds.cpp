@@ -115,6 +115,71 @@ static void clearDir(const char *path) {
     closedir(dir);
 }
 
+// ============================================================
+// Stale-file cleanup
+// ============================================================
+//
+// win-<id>.ppm / win-<id>.meta are keyed by an X window id and get
+// rewritten in place for as long as that window is alive, but nothing
+// ever deletes them once the window closes — the id simply stops
+// appearing in future capture cycles and the files sit there forever.
+// Likewise <desktop>.ppm desktop-icon files are keyed by an EWMH desktop
+// number, which goes stale when _NET_NUMBER_OF_DESKTOPS shrinks (a
+// desktop that's merely renumbered is still < numDesktops and gets
+// rewritten normally on its next capture, so it's never mistaken for
+// stale here). This walks runDir once per capture and removes anything
+// whose owning window or desktop no longer exists.
+static void cleanupStaleFiles(const std::vector<Window> &liveWindows,
+                               long numDesktops) {
+    std::vector<unsigned long> liveIds;
+    liveIds.reserve(liveWindows.size());
+    for (Window w : liveWindows)
+        liveIds.push_back((unsigned long)w);
+    std::sort(liveIds.begin(), liveIds.end());
+
+    auto isLiveWindow = [&](unsigned long id) {
+        return std::binary_search(liveIds.begin(), liveIds.end(), id);
+    };
+
+    DIR *dir = opendir(runDir.c_str());
+    if (!dir) return;
+
+    char full[PATH_MAX];
+    struct dirent *ent;
+    while ((ent = readdir(dir))) {
+        const std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+
+        bool stale = false;
+
+        if (name.rfind("win-", 0) == 0) {
+            // win-<id>.ppm or win-<id>.meta
+            const std::string rest = name.substr(4);
+            char *end = nullptr;
+            unsigned long id = strtoul(rest.c_str(), &end, 10);
+            if (end == rest.c_str()) continue;   // not "win-<digits>...", leave alone
+            if (strcmp(end, ".ppm") && strcmp(end, ".meta")) continue; // unknown suffix, leave alone
+            stale = !isLiveWindow(id);
+        } else if (name.size() > 4 &&
+                   name.compare(name.size() - 4, 4, ".ppm") == 0) {
+            // <desktop>.ppm — the whole stem must be digits, which
+            // excludes cap-<mon>-<seq>.ppm (starts with a non-digit) and
+            // leaves those temp files to ScreenshotRef as before.
+            char *end = nullptr;
+            long desk = strtol(name.c_str(), &end, 10);
+            if (end == name.c_str() || strcmp(end, ".ppm") != 0) continue;
+            stale = (desk < 0 || desk >= numDesktops);
+        } else {
+            continue;
+        }
+
+        if (!stale) continue;
+        snprintf(full, sizeof(full), "%s/%s", runDir.c_str(), name.c_str());
+        unlink(full);
+    }
+    closedir(dir);
+}
+
 // Strip trailing newline
 static void chomp(std::string &s) {
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
@@ -381,6 +446,30 @@ static std::vector<std::pair<Window, std::string>> getWindowList(Display* dpy, c
             result.emplace_back(windows[i], std::move(title));
     }
 
+    XFree(data);
+    return result;
+}
+
+// Raw _NET_CLIENT_LIST window ids, with no title/viewability filtering.
+// Used for liveness checks (e.g. stale-file cleanup) where a minimized or
+// untitled window must still count as "alive".
+static std::vector<Window> getClientListWindows(Display* dpy, const Atoms& atoms) {
+    std::vector<Window> result;
+
+    Window root = DefaultRootWindow(dpy);
+
+    Atom actualType;
+    int actualFormat;
+    unsigned long nitems, bytesAfter;
+    unsigned char* data = nullptr;
+
+    if (XGetWindowProperty(dpy, root, atoms.netClientList, 0, (~0L), False,
+                           XA_WINDOW, &actualType, &actualFormat,
+                           &nitems, &bytesAfter, &data) != Success || !data)
+        return result;
+
+    Window* windows = reinterpret_cast<Window*>(data);
+    result.assign(windows, windows + nitems);
     XFree(data);
     return result;
 }
@@ -1311,6 +1400,12 @@ static bool captureMonitorDesktops(Display *dpy,
         }
         enqueueCropJobs(std::move(jobs));
     }
+
+    // Sweep runDir for window/desktop files whose owner no longer exists.
+    // Cheap relative to the capture work above, and running it here means
+    // cleanup happens on the same cadence as captures (every desktop
+    // switch) instead of needing a separate timer or daemon restart.
+    cleanupStaleFiles(getClientListWindows(dpy, atoms), num_desktops);
 
     return saved_count > 0;
 }
