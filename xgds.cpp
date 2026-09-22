@@ -1155,10 +1155,19 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
 //
 // Screenshot capture must stay fast, since it happens on every desktop
 // switch. Cropping the individual windows out of it is comparatively slow
-// (one decode+crop+encode per window) and nothing waiting on the client
-// side actually needs it to finish before the switch proceeds. So capture
-// only writes the full per-monitor screenshot and hands off, and a
-// background thread does the cropping afterwards.
+// (one decode+crop+encode per window), so capture hands each monitor's
+// windows to a background thread and goes straight on to grabbing the
+// next monitor, overlapping the two.
+//
+// The crops are not optional work, though: the picker composites its
+// desktop icons out of them (compositeDesktopScreenshot) as soon as its
+// `xgds screenshot` call is acknowledged, and that ack is the only
+// synchronisation point the client has. A capture therefore waits for its
+// own jobs to land on disk (waitForCrops) before reporting success.
+// Acking earlier made the menu render the crops of the *previous* capture
+// of that desktop, and since a desktop is only re-captured while it is
+// visible, that image could be hours old even though `xgds screenshot`
+// had run many times since.
 //
 // A monitor's temporary screenshot file is shared by every window that was
 // on that desktop when it was captured. It's wrapped in a ScreenshotRef and
@@ -1181,14 +1190,20 @@ struct CropJob {
 };
 
 static std::mutex              g_cropMutex;
-static std::condition_variable g_cropCv;
+static std::condition_variable g_cropCv;      // queue non-empty / stop
+static std::condition_variable g_cropIdleCv;  // all jobs written to disk
 static std::queue<CropJob>     g_cropQueue;
 static std::atomic<bool>       g_cropStop{false};
+// Jobs accepted but not yet written out. Counted rather than derived from
+// g_cropQueue.size(), which drops to zero while the last job is still
+// being cropped.
+static size_t                  g_cropPending = 0;
 
 static void enqueueCropJobs(std::vector<CropJob> jobs) {
     if (jobs.empty()) return;
     {
         std::lock_guard<std::mutex> lock(g_cropMutex);
+        g_cropPending += jobs.size();
         for (auto &j : jobs) g_cropQueue.push(std::move(j));
     }
     g_cropCv.notify_all();
@@ -1218,7 +1233,26 @@ static void cropWorker() {
         // job (and its shared_ptr<ScreenshotRef>) is destroyed here; once
         // every job sharing this screenshot has gone through this path,
         // ScreenshotRef's destructor removes the temp file.
+        job.screenshot.reset();
+
+        // Only now is this job's output on disk, so only now may a capture
+        // blocked in waitForCrops() count it as done.
+        {
+            std::lock_guard<std::mutex> lock(g_cropMutex);
+            --g_cropPending;
+        }
+        g_cropIdleCv.notify_all();
     }
+}
+
+// Block until every queued crop has been written out (or the daemon is
+// shutting down). Called by the capture path so that the ack sent to the
+// client implies the window crops on disk are from this capture.
+static void waitForCrops() {
+    std::unique_lock<std::mutex> lock(g_cropMutex);
+    g_cropIdleCv.wait(lock, [] {
+        return g_cropPending == 0 || g_cropStop.load();
+    });
 }
 
 
@@ -1302,82 +1336,57 @@ static bool captureMonitorDesktops(Display *dpy,
     // Total number of desktops.
     long num_desktops = read_cardinal(atoms.netNumberOfDesktops, 1);
 
-    // For each monitor, find which desktop is currently visible on
-    // it by matching the desktop's viewport origin to the monitor
-    // geometry.  A desktop is "on" a monitor when its viewport
-    // origin falls inside (or equals the top-left of) that monitor.
-    //
-    // Fallback: if no desktop maps to a monitor (e.g. the WM uses a
-    // single shared viewport), use _NET_CURRENT_DESKTOP for every
-    // monitor so we at least capture something useful.
-    long current_desk = read_cardinal(atoms.netCurrentDesktop, -1);
-    long current_mon = -1;
-    if (current_desk < 0) {
-        fprintf(stderr, NAME ": screenshot skipped - current desktop not found\n");
-        return false;
-    }
-
-    // _NET_DESKTOP_VIEWPORT: pairs of (x,y) per desktop that tell
-    // which viewport origin each desktop is mapped to.  On WMs that
-    // assign one desktop per monitor (e.g. bspwm, Openbox with
-    // per-monitor workspaces) the viewport origin equals the
-    // monitor's top-left corner.
-    std::vector<std::pair<long, long>> viewport(num_desktops, {-1, -1});
-    if (XGetWindowProperty(dpy, root, atoms.netDesktopViewport, 0,
-                           num_desktops * 2, False, XA_CARDINAL,
-                           &atype, &afmt, &nitems, &after, &data) == Success
-        && data) {
-        auto *vals = (unsigned long *)data;
-        for (long d = 0;
-             d < num_desktops &&
-                 (unsigned long)(d * 2 + 1) < nitems;
-             ++d) {
-            viewport[d] = {
-                (long)vals[d * 2],
-                (long)vals[d * 2 + 1]
-            };
-        }
-        XFree(data);
-        data = nullptr;
-    }
-
-    auto monitor_for_point = [&](long x, long y) -> long {
-        for (size_t mi = 0; mi < monitors.size(); ++mi) {
-            const Monitor &m = monitors[mi];
-            if (x >= m.x && x < m.x + m.w &&
-                y >= m.y && y < m.y + m.h) {
-                return (long)mi;
-            }
-        }
-        return -1;
-    };
-
-    // Build monitor→desktop mapping.
-    std::vector<long> mon_desk(monitors.size(), -1);
-    for (long d = 0; d < num_desktops; ++d) {
-        const auto &[vx, vy] = viewport[d];
-        if (vx < 0 || vy < 0)
-            continue;
-        long mi = monitor_for_point(vx, vy);
-        if (mi < 0)
-            continue;
-        mon_desk[mi] = d;
-        if (d == current_desk)
-            current_mon = mi;
-    }
-
     // Gather every window's absolute geometry once; cheap (attribute/property
     // queries only, no pixel data) compared to rasterizing window contents.
     const std::vector<WinGeom> all_wins = getAllWindowGeometries(dpy, atoms);
 
-    // Capture every monitor and save its PPM — this is the only part that
-    // has to be fast, since it happens on every desktop switch. Cropping
-    // individual windows out of it is handed off to the background queue;
-    // this function returns as soon as the raw screenshots are on disk.
+    // Which monitor's capture does each window get cropped out of? Decide
+    // it from the window's own geometry: the monitor it overlaps most, or
+    // -1 if it overlaps none.
+    //
+    // This used to be inferred instead from _NET_DESKTOP_VIEWPORT — build
+    // a monitor→desktop table from each desktop's viewport origin, then
+    // crop only the windows whose _NET_WM_DESKTOP matched that table.
+    // That silently produced no crops at all on the common configurations
+    // where the property does not describe what the code assumed: WMs
+    // that publish a single (0,0) pair for every desktop (so only desktop
+    // 0 was ever mapped, and any other current desktop fell through to a
+    // table entry whose windows are unmapped), WMs that omit the property
+    // entirely, and per-monitor-workspace WMs that give several desktops
+    // the same viewport origin (last one wins, so the visible desktop on
+    // every monitor but one was skipped). Those desktops then kept
+    // whatever crops they had, forever, no matter how often `xgds
+    // screenshot` ran.
+    //
+    // Geometry needs no such assumption: getAllWindowGeometries() already
+    // filters to IsViewable windows, i.e. exactly what is on screen right
+    // now, so whatever a window overlaps is where its pixels are. Windows
+    // parked off-screen by viewport-style WMs overlap nothing and are
+    // skipped. The desktop number is not consulted at all.
+    auto monitor_for_window = [&](const WinGeom &g) -> long {
+        long best = -1, best_area = 0;
+        for (size_t mi = 0; mi < monitors.size(); ++mi) {
+            const Monitor &m = monitors[mi];
+            const long ow = std::min<long>(g.x + g.w, m.x + m.w) -
+                            std::max<long>(g.x, m.x);
+            const long oh = std::min<long>(g.y + g.h, m.y + m.h) -
+                            std::max<long>(g.y, m.y);
+            if (ow <= 0 || oh <= 0) continue;
+            if (ow * oh > best_area) { best_area = ow * oh; best = (long)mi; }
+        }
+        return best;
+    };
+
+    std::vector<long> win_mon(all_wins.size());
+    for (size_t i = 0; i < all_wins.size(); ++i)
+        win_mon[i] = monitor_for_window(all_wins[i]);
+
+    // Capture every monitor and save its PPM. Cropping individual windows
+    // out of it is handed off to the background queue so it overlaps with
+    // grabbing the remaining monitors, but this function does not return
+    // until those crops have landed (see waitForCrops below).
     int saved_count = 0;
     for (size_t mi = 0; mi < monitors.size(); ++mi) {
-        long desk = ((long)mi == current_mon) ?
-            current_desk : mon_desk[mi];
         grabMonitor(dpy, monitors[mi], shms[mi]);
         std::string path = rawCapturePath(mi);
         if (!savePpm(dpy, shms[mi].img, path.c_str()))
@@ -1386,20 +1395,25 @@ static bool captureMonitorDesktops(Display *dpy,
 
         // Reference-counted handle to the temp screenshot: it's deleted
         // automatically once every job below has consumed it (see
-        // ScreenshotRef). If this desktop has no windows, the shared_ptr
+        // ScreenshotRef). If this monitor has no windows, the shared_ptr
         // simply goes out of scope at the end of this iteration and the
         // file is removed immediately.
         auto screenshot = std::make_shared<ScreenshotRef>(path);
 
         std::vector<CropJob> jobs;
-        for (const auto& g : all_wins) {
-            if (g.desktop != desk) continue;
+        for (size_t wi = 0; wi < all_wins.size(); ++wi) {
+            if (win_mon[wi] != (long)mi) continue;
+            const WinGeom &g = all_wins[wi];
             jobs.push_back({ screenshot, g.id,
                              g.x - monitors[mi].x, g.y - monitors[mi].y,
                              g.w, g.h });
         }
         enqueueCropJobs(std::move(jobs));
     }
+
+    // The client composites desktop icons from the per-window crops the
+    // moment this request is acked, so the crops must be on disk first.
+    waitForCrops();
 
     // Sweep runDir for window/desktop files whose owner no longer exists.
     // Cheap relative to the capture work above, and running it here means
@@ -1478,6 +1492,12 @@ static int runDaemon() {
     // only touches plain files (raw PPM read/write), never X, so it's safe
     // to run alongside the X11 event loop below without any Xlib locking.
     std::thread worker(cropWorker);
+
+    // runDir was just cleared, so nothing has a crop yet. Capture once up
+    // front: it cannot fill in desktops that have not been displayed, but
+    // it at least gives the first picker invocation icons for the desktop
+    // that is visible right now.
+    captureMonitorDesktops(dpy, monitors, shms, atoms);
 
     printf(NAME " daemon: ready — listening on %s\n", sockPath.c_str());
     fflush(stdout);
@@ -1672,10 +1692,11 @@ static int runPicker(PickerMode mode) {
     // Build the gmenu item list in memory (same format as before)
     std::ostringstream oss;
     if (mode == PICK_WINDOW) {
-        // The daemon crops these asynchronously in the background; we just
-        // use whatever's on disk already (falling back to the generic
-        // "window" icon if a crop hasn't landed yet, e.g. right after the
-        // very first screenshot before the worker catches up).
+        // clientScreenshot() above only returns once the daemon has
+        // written the crops for the currently-visible desktop, so those
+        // are current. Windows on other desktops keep their last crop —
+        // they aren't on screen, so there is nothing newer to capture —
+        // and windows never yet captured fall back to a generic icon.
         auto winlist = getWindowList(dpy, atoms);
         Window active = getActiveWindow(dpy, atoms);
         for (size_t i = 0; i < winlist.size(); ++i) {
