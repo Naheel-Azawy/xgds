@@ -1,11 +1,16 @@
 // xgds - X gmenu desktop switcher
 // Dependencies: X11, XShm, XRandR, gmenu
 //
-// Screenshots are handled as raw P6 PPMs end-to-end (capture, crop,
-// composite) with plain fread/fwrite/memcpy — see savePpm,
-// cropWindowScreenshot, and compositeDesktopScreenshot. There is
-// intentionally no image-library dependency: every file this program reads
-// was written by this program, so there's no format to negotiate.
+// Screenshots are handled as 32bpp BGRA BMPs (BITMAPV4HEADER, BI_BITFIELDS,
+// top-down) end-to-end (capture, crop, composite) with plain
+// fread/fwrite/memcpy — see saveBmp, cropWindowScreenshot, and
+// compositeDesktopScreenshot. There is intentionally no image-library
+// dependency: every file this program reads was written by this program,
+// so there's no format to negotiate. The alpha channel is always opaque
+// (255) for pixels captured straight off the X server; only
+// compositeDesktopScreenshot's canvas background ever uses a different
+// alpha, for the part of a desktop icon that no window covers (see
+// kCanvasBg).
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -28,6 +33,7 @@
 #include <climits>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -69,7 +75,7 @@ static void initPaths() {
 }
 
 static std::string desktopScreenshotPath(long desk) {
-    return runDir + "/" + std::to_string(desk) + ".ppm";
+    return runDir + "/" + std::to_string(desk) + ".bmp";
 }
 
 // Temp file for a single monitor's raw capture, used only as input to the
@@ -86,11 +92,11 @@ static std::atomic<unsigned long> g_captureSeq{0};
 
 static std::string rawCapturePath(size_t monitorIndex) {
     return runDir + "/cap-" + std::to_string(monitorIndex) + "-" +
-           std::to_string(g_captureSeq.fetch_add(1)) + ".ppm";
+           std::to_string(g_captureSeq.fetch_add(1)) + ".bmp";
 }
 
 static std::string windowScreenshotPath(Window w) {
-    return runDir + "/win-" + std::to_string((unsigned long)w) + ".ppm";
+    return runDir + "/win-" + std::to_string((unsigned long)w) + ".bmp";
 }
 
 static void ensureDir(const char *path) {
@@ -119,11 +125,11 @@ static void clearDir(const char *path) {
 // Stale-file cleanup
 // ============================================================
 //
-// win-<id>.ppm / win-<id>.meta are keyed by an X window id and get
+// win-<id>.bmp / win-<id>.meta are keyed by an X window id and get
 // rewritten in place for as long as that window is alive, but nothing
 // ever deletes them once the window closes — the id simply stops
 // appearing in future capture cycles and the files sit there forever.
-// Likewise <desktop>.ppm desktop-icon files are keyed by an EWMH desktop
+// Likewise <desktop>.bmp desktop-icon files are keyed by an EWMH desktop
 // number, which goes stale when _NET_NUMBER_OF_DESKTOPS shrinks (a
 // desktop that's merely renumbered is still < numDesktops and gets
 // rewritten normally on its next capture, so it's never mistaken for
@@ -153,21 +159,21 @@ static void cleanupStaleFiles(const std::vector<Window> &liveWindows,
         bool stale = false;
 
         if (name.rfind("win-", 0) == 0) {
-            // win-<id>.ppm or win-<id>.meta
+            // win-<id>.bmp or win-<id>.meta
             const std::string rest = name.substr(4);
             char *end = nullptr;
             unsigned long id = strtoul(rest.c_str(), &end, 10);
             if (end == rest.c_str()) continue;   // not "win-<digits>...", leave alone
-            if (strcmp(end, ".ppm") && strcmp(end, ".meta")) continue; // unknown suffix, leave alone
+            if (strcmp(end, ".bmp") && strcmp(end, ".meta")) continue; // unknown suffix, leave alone
             stale = !isLiveWindow(id);
         } else if (name.size() > 4 &&
-                   name.compare(name.size() - 4, 4, ".ppm") == 0) {
-            // <desktop>.ppm — the whole stem must be digits, which
-            // excludes cap-<mon>-<seq>.ppm (starts with a non-digit) and
+                   name.compare(name.size() - 4, 4, ".bmp") == 0) {
+            // <desktop>.bmp — the whole stem must be digits, which
+            // excludes cap-<mon>-<seq>.bmp (starts with a non-digit) and
             // leaves those temp files to ScreenshotRef as before.
             char *end = nullptr;
             long desk = strtol(name.c_str(), &end, 10);
-            if (end == name.c_str() || strcmp(end, ".ppm") != 0) continue;
+            if (end == name.c_str() || strcmp(end, ".bmp") != 0) continue;
             stale = (desk < 0 || desk >= numDesktops);
         } else {
             continue;
@@ -827,7 +833,7 @@ static void shmFree(Display *dpy, ShmImage &s) {
 }
 
 // ============================================================
-// Screenshot + PPM writer
+// Screenshot + BMP writer
 // ============================================================
 
 static void grabMonitor(Display *dpy, const Monitor &mon, const ShmImage &s) {
@@ -835,11 +841,123 @@ static void grabMonitor(Display *dpy, const Monitor &mon, const ShmImage &s) {
     XFlush(dpy);
 }
 
-static bool savePpm(Display *dpy, XImage *img, const char *path) {
+// ------------------------------------------------------------
+// BMP header (BITMAPV4HEADER, 32bpp BGRA, top-down)
+// ------------------------------------------------------------
+//
+// A plain BITMAPINFOHEADER's 32bpp mode has no defined alpha channel —
+// viewers are free to (and mostly do) ignore the 4th byte. BITMAPV4HEADER
+// adds explicit per-channel bit masks and a colorspace tag, which is what
+// actually makes the 4th byte a real, honoured alpha channel. Height is
+// stored negative to mean "top-down" (row 0 = top row), which matches the
+// row order the rest of this file already assumes and needs no vertical
+// flip on read or write.
+#pragma pack(push, 1)
+struct BmpFileHeader {
+    uint16_t type;      // 'BM'
+    uint32_t fileSize;
+    uint16_t reserved1;
+    uint16_t reserved2;
+    uint32_t offBits;   // offset from start of file to pixel data
+};
+
+struct BmpV4Header {
+    uint32_t headerSize;     // sizeof(BmpV4Header) == 108
+    int32_t  width;
+    int32_t  height;         // negative => top-down
+    uint16_t planes;         // 1
+    uint16_t bitCount;       // 32
+    uint32_t compression;    // BI_BITFIELDS
+    uint32_t imageSize;
+    int32_t  xPelsPerMeter;
+    int32_t  yPelsPerMeter;
+    uint32_t colorsUsed;
+    uint32_t colorsImportant;
+    uint32_t redMask;
+    uint32_t greenMask;
+    uint32_t blueMask;
+    uint32_t alphaMask;
+    uint32_t colorSpaceType; // LCS_sRGB
+    int32_t  endpoints[9];   // CIEXYZTRIPLE, unused under LCS_sRGB
+    uint32_t gammaRed;
+    uint32_t gammaGreen;
+    uint32_t gammaBlue;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(BmpFileHeader) == 14, "unexpected BMP file header size");
+static_assert(sizeof(BmpV4Header)   == 108, "unexpected BITMAPV4HEADER size");
+
+static constexpr uint32_t kBiBitfields = 3;
+static constexpr uint32_t kLcsSRgb     = 0x73524742;
+
+// Background for the area of a desktop-icon canvas that no window covers
+// (see compositeDesktopScreenshot). Transparent by default so the desktop
+// picker shows through instead of a black rectangle. Change these values
+// — or wire this up to a config source such as a CLI flag or environment
+// variable — to use an opaque background color instead. Order matches the
+// BGRA pixel layout written by writeBmpHeader/saveBmp.
+struct BgColor { unsigned char b, g, r, a; };
+static constexpr BgColor kCanvasBg = { 0, 0, 0, 0 }; // transparent
+
+// Write a BMP file header + BITMAPV4HEADER for a w×h, 32bpp BGRA, top-down
+// image. Caller writes exactly w*h*4 bytes of pixel data immediately after.
+static bool writeBmpHeader(FILE *fp, int w, int h) {
+    const uint32_t pixelBytes = (uint32_t)w * (uint32_t)h * 4;
+
+    BmpFileHeader fh{};
+    fh.type     = 0x4D42; // 'BM'
+    fh.offBits  = (uint32_t)(sizeof(BmpFileHeader) + sizeof(BmpV4Header));
+    fh.fileSize = fh.offBits + pixelBytes;
+
+    BmpV4Header ih{};
+    ih.headerSize     = sizeof(BmpV4Header);
+    ih.width          = w;
+    ih.height         = -h; // top-down
+    ih.planes         = 1;
+    ih.bitCount       = 32;
+    ih.compression    = kBiBitfields;
+    ih.imageSize      = pixelBytes;
+    ih.redMask        = 0x00FF0000;
+    ih.greenMask      = 0x0000FF00;
+    ih.blueMask       = 0x000000FF;
+    ih.alphaMask      = 0xFF000000;
+    ih.colorSpaceType = kLcsSRgb;
+
+    return fwrite(&fh, sizeof(fh), 1, fp) == 1 &&
+           fwrite(&ih, sizeof(ih), 1, fp) == 1;
+}
+
+// Parse a BMP written by writeBmpHeader() above and leave *fp* positioned
+// at the start of its pixel data. Only our own exact layout is accepted —
+// same principle the old PPM code relied on: every file this reads was
+// written by this program, so there's no format to negotiate.
+static bool readBmpHeader(FILE *fp, int &w, int &h) {
+    BmpFileHeader fh{};
+    BmpV4Header   ih{};
+    if (fread(&fh, sizeof(fh), 1, fp) != 1 || fh.type != 0x4D42)
+        return false;
+    if (fread(&ih, sizeof(ih), 1, fp) != 1)
+        return false;
+    if (ih.headerSize != sizeof(BmpV4Header) ||
+        ih.bitCount    != 32 ||
+        ih.compression != kBiBitfields ||
+        ih.height      >= 0)  // must be top-down
+        return false;
+
+    w = ih.width;
+    h = -ih.height;
+    if (w <= 0 || h <= 0) return false;
+
+    return fseek(fp, (long)fh.offBits, SEEK_SET) == 0;
+}
+
+static bool saveBmp(Display *dpy, XImage *img, const char *path) {
     FILE *fp = fopen(path, "wb");
     if (!fp) { fprintf(stderr, NAME ": fopen(%s): %s\n", path, strerror(errno)); return false; }
 
-    fprintf(fp, "P6\n%d %d\n255\n", img->width, img->height);
+    const int w = img->width, h = img->height;
+    if (!writeBmpHeader(fp, w, h)) { fclose(fp); return false; }
 
     Visual       *vis   = DefaultVisual(dpy, DefaultScreen(dpy));
     unsigned long rmask = vis->red_mask;
@@ -850,8 +968,11 @@ static bool savePpm(Display *dpy, XImage *img, const char *path) {
     while (!((gmask >> gs) & 1)) ++gs;
     while (!((bmask >> bs) & 1)) ++bs;
 
-    int w = img->width, h = img->height;
-    unsigned char *row = (unsigned char *)malloc((size_t)w * 3);
+    // Pixels captured straight off the X server are fully opaque screen
+    // content and carry no alpha of their own, so alpha is always 255
+    // here. Transparency only enters later, in the canvas background of
+    // compositeDesktopScreenshot (see kCanvasBg).
+    unsigned char *row = (unsigned char *)malloc((size_t)w * 4);
     if (!row) { fclose(fp); return false; }
 
     bool ok = true;
@@ -859,11 +980,12 @@ static bool savePpm(Display *dpy, XImage *img, const char *path) {
         unsigned char *p = row;
         for (int x = 0; x < w; ++x) {
             unsigned long px = XGetPixel(img, x, y);
-            *p++ = (unsigned char)((px & rmask) >> rs);
-            *p++ = (unsigned char)((px & gmask) >> gs);
-            *p++ = (unsigned char)((px & bmask) >> bs);
+            *p++ = (unsigned char)((px & bmask) >> bs); // B
+            *p++ = (unsigned char)((px & gmask) >> gs); // G
+            *p++ = (unsigned char)((px & rmask) >> rs); // R
+            *p++ = 255;                                  // A (opaque)
         }
-        if (fwrite(row, 1, (size_t)w * 3, fp) != (size_t)w * 3) ok = false;
+        if (fwrite(row, 1, (size_t)w * 4, fp) != (size_t)w * 4) ok = false;
     }
 
     free(row);
@@ -877,48 +999,24 @@ static bool savePpm(Display *dpy, XImage *img, const char *path) {
 // already sitting on disk. Coordinates are clamped to the source image
 // bounds in case a window is partially off-screen.
 //
-// Both files are always our own P6 PPMs (see savePpm), so — same idea as
-// compositeDesktopScreenshot below — we parse and blit them directly
-// instead of going through ImageMagick's decode/encode pipeline. We also
-// fseek() past the rows above the crop region instead of reading and
-// discarding them, since a crop only ever needs a horizontal band of the
-// source.
-static bool cropWindowScreenshot(const std::string &desktop_ppm,
+// Both files are always our own 32bpp BGRA BMPs (see saveBmp), so — same
+// idea as compositeDesktopScreenshot below — we parse and blit them
+// directly instead of going through ImageMagick's decode/encode pipeline.
+// We also fseek() past the rows above the crop region instead of reading
+// and discarding them, since a crop only ever needs a horizontal band of
+// the source. Alpha is carried straight through, unexamined — every pixel
+// in a desktop capture is opaque screen content (see saveBmp), so there's
+// nothing here that would need to look at it.
+static bool cropWindowScreenshot(const std::string &desktop_bmp,
                                    int x, int y, int w, int h,
                                    const std::string &out_path) {
     if (w <= 0 || h <= 0) return false;
 
-    FILE *f = fopen(desktop_ppm.c_str(), "rb");
+    FILE *f = fopen(desktop_bmp.c_str(), "rb");
     if (!f) return false;
 
-    char magic[3] = {};
-    if (fscanf(f, "%2s", magic) != 1 || strcmp(magic, "P6") != 0) {
-        fclose(f);
-        return false;
-    }
-
-    auto skip_comments = [&]() {
-        int c;
-        while ((c = fgetc(f)) != EOF) {
-            if (isspace(c)) continue;
-            if (c == '#') {
-                while ((c = fgetc(f)) != EOF && c != '\n') ;
-                continue;
-            }
-            ungetc(c, f);
-            break;
-        }
-    };
-
-    int iw = 0, ih = 0, maxval = 0;
-    skip_comments();
-    if (fscanf(f, "%d", &iw) != 1) { fclose(f); return false; }
-    skip_comments();
-    if (fscanf(f, "%d", &ih) != 1) { fclose(f); return false; }
-    skip_comments();
-    if (fscanf(f, "%d", &maxval) != 1) { fclose(f); return false; }
-    if (iw <= 0 || ih <= 0 || maxval != 255) { fclose(f); return false; }
-    fgetc(f);  // consume the single whitespace byte after maxval
+    int iw = 0, ih = 0;
+    if (!readBmpHeader(f, iw, ih)) { fclose(f); return false; }
 
     // Clamp the crop rect to the source image bounds.
     long cx = x, cy = y, cw = w, ch = h;
@@ -929,8 +1027,8 @@ static bool cropWindowScreenshot(const std::string &desktop_ppm,
     if (cw <= 0 || ch <= 0) { fclose(f); return false; }
 
     const long header_end = ftell(f);
-    const size_t src_row_bytes = (size_t)iw * 3;
-    const size_t dst_row_bytes = (size_t)cw * 3;
+    const size_t src_row_bytes = (size_t)iw * 4;
+    const size_t dst_row_bytes = (size_t)cw * 4;
 
     if (header_end < 0 ||
         fseek(f, header_end + cy * (long)src_row_bytes, SEEK_SET) != 0) {
@@ -948,15 +1046,15 @@ static bool cropWindowScreenshot(const std::string &desktop_ppm,
             break;
         }
         memcpy(out_buf.data() + (size_t)ry * dst_row_bytes,
-               row.data() + (size_t)cx * 3, dst_row_bytes);
+               row.data() + (size_t)cx * 4, dst_row_bytes);
     }
     fclose(f);
     if (!ok) return false;
 
     FILE *out = fopen(out_path.c_str(), "wb");
     if (!out) return false;
-    fprintf(out, "P6\n%ld %ld\n255\n", cw, ch);
     const bool write_ok =
+        writeBmpHeader(out, (int)cw, (int)ch) &&
         fwrite(out_buf.data(), 1, out_buf.size(), out) == out_buf.size();
     fclose(out);
     return write_ok;
@@ -969,10 +1067,11 @@ static bool cropWindowScreenshot(const std::string &desktop_ppm,
 // window's own image/geometry is looked up by its immutable id. The result
 // is always consistent with the current desktop layout, never stale.
 //
-// Both this function and cropWindowScreenshot() above work on our own P6
-// PPMs directly (parse header, blit rows, write header+bytes) rather than
-// going through ImageMagick — avoids the library's decode/encode overhead
-// and per-call setup cost for a format we fully control on both ends.
+// Both this function and cropWindowScreenshot() above work on our own
+// 32bpp BGRA BMPs directly (parse header, blit rows, write header+bytes)
+// rather than going through ImageMagick — avoids the library's
+// decode/encode overhead and per-call setup cost for a format we fully
+// control on both ends.
 static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
                                          const std::string &out_path) {
     struct Placed {
@@ -1017,12 +1116,9 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
     if (canvas_w <= 0 || canvas_h <= 0)
         return false;
 
-    // RGB canvas; background color
-    constexpr unsigned char BG_R = 0;
-    constexpr unsigned char BG_G = 0;
-    constexpr unsigned char BG_B = 0;
-
-    const size_t canvas_stride = static_cast<size_t>(canvas_w) * 3;
+    // RGBA canvas; background color is kCanvasBg (transparent by default —
+    // see its definition above saveBmp for how to change it).
+    const size_t canvas_stride = static_cast<size_t>(canvas_w) * 4;
     const size_t canvas_size =
         static_cast<size_t>(canvas_h) * canvas_stride;
 
@@ -1034,9 +1130,10 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
                              static_cast<size_t>(y) * canvas_stride;
 
         for (int x = 0; x < canvas_w; ++x) {
-            row[x * 3 + 0] = BG_R;
-            row[x * 3 + 1] = BG_G;
-            row[x * 3 + 2] = BG_B;
+            row[x * 4 + 0] = kCanvasBg.b;
+            row[x * 4 + 1] = kCanvasBg.g;
+            row[x * 4 + 2] = kCanvasBg.r;
+            row[x * 4 + 3] = kCanvasBg.a;
         }
     }
 
@@ -1047,69 +1144,13 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
         if (!f)
             continue;
 
-        /*
-         * PPM header:
-         *
-         * P6
-         * width height
-         * 255
-         */
-        char magic[3] = {};
-        if (fscanf(f, "%2s", magic) != 1 ||
-            strcmp(magic, "P6") != 0) {
+        int w = 0, h = 0;
+        if (!readBmpHeader(f, w, h)) {
             fclose(f);
             continue;
         }
 
-        auto skip_comments = [&]() {
-            int c;
-
-            while ((c = fgetc(f)) != EOF) {
-                if (isspace(c))
-                    continue;
-
-                if (c == '#') {
-                    while ((c = fgetc(f)) != EOF && c != '\n')
-                        ;
-                    continue;
-                }
-
-                ungetc(c, f);
-                break;
-            }
-        };
-
-        int w = 0;
-        int h = 0;
-        int maxval = 0;
-
-        skip_comments();
-        if (fscanf(f, "%d", &w) != 1) {
-            fclose(f);
-            continue;
-        }
-
-        skip_comments();
-        if (fscanf(f, "%d", &h) != 1) {
-            fclose(f);
-            continue;
-        }
-
-        skip_comments();
-        if (fscanf(f, "%d", &maxval) != 1) {
-            fclose(f);
-            continue;
-        }
-
-        if (w <= 0 || h <= 0 || maxval != 255) {
-            fclose(f);
-            continue;
-        }
-
-        // Consume the whitespace after maxval.
-        fgetc(f);
-
-        const size_t row_bytes = static_cast<size_t>(w) * 3;
+        const size_t row_bytes = static_cast<size_t>(w) * 4;
 
         std::vector<unsigned char> row(row_bytes);
 
@@ -1134,13 +1175,16 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
             unsigned char* dst =
                 canvas.data() +
                 static_cast<size_t>(dst_y) * canvas_stride +
-                static_cast<size_t>(dst_x) * 3;
+                static_cast<size_t>(dst_x) * 4;
 
             const unsigned char* src =
                 row.data() +
-                static_cast<size_t>(src_x) * 3;
+                static_cast<size_t>(src_x) * 4;
 
-            memcpy(dst, src, static_cast<size_t>(copy_width) * 3);
+            // Window crops are always fully opaque (alpha 255; see
+            // saveBmp), so this copy also overwrites the background's
+            // alpha byte wherever a window actually covers the canvas.
+            memcpy(dst, src, static_cast<size_t>(copy_width) * 4);
         }
 
         fclose(f);
@@ -1150,18 +1194,14 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
     if (!placed_any)
         return false;
 
-    /*
-     * Write the final image.
-     *
-     * If out_path is .ppm, this is extremely fast.
-     */
+    // Write the final image. Since out_path is our own uncompressed BMP
+    // format, this is just a header write plus one bulk fwrite.
     FILE* out = fopen(out_path.c_str(), "wb");
     if (!out)
         return false;
 
-    fprintf(out, "P6\n%d %d\n255\n", canvas_w, canvas_h);
-
     const bool write_ok =
+        writeBmpHeader(out, canvas_w, canvas_h) &&
         fwrite(canvas.data(), 1, canvas.size(), out) == canvas.size();
 
     fclose(out);
@@ -1404,7 +1444,7 @@ static bool captureMonitorDesktops(Display *dpy,
     for (size_t i = 0; i < all_wins.size(); ++i)
         win_mon[i] = monitor_for_window(all_wins[i]);
 
-    // Capture every monitor and save its PPM. Cropping individual windows
+    // Capture every monitor and save its BMP. Cropping individual windows
     // out of it is handed off to the background queue so it overlaps with
     // grabbing the remaining monitors, but this function does not return
     // until those crops have landed (see waitForCrops below).
@@ -1412,7 +1452,7 @@ static bool captureMonitorDesktops(Display *dpy,
     for (size_t mi = 0; mi < monitors.size(); ++mi) {
         grabMonitor(dpy, monitors[mi], shms[mi]);
         std::string path = rawCapturePath(mi);
-        if (!savePpm(dpy, shms[mi].img, path.c_str()))
+        if (!saveBmp(dpy, shms[mi].img, path.c_str()))
             continue;
         ++saved_count;
 
@@ -1513,7 +1553,7 @@ static int runDaemon() {
 
     // Background thread that crops individual windows out of the desktop
     // screenshots asynchronously (see enqueueCropJobs/cropWorker). It
-    // only touches plain files (raw PPM read/write), never X, so it's safe
+    // only touches plain files (raw BMP read/write), never X, so it's safe
     // to run alongside the X11 event loop below without any Xlib locking.
     std::thread worker(cropWorker);
 
@@ -1728,10 +1768,10 @@ static int runPicker(PickerMode mode) {
             if (win == active)
                 focused_idx = (int)i;
 
-            const std::string ppm = windowScreenshotPath(win);
+            const std::string bmp = windowScreenshotPath(win);
             struct stat st;
             const std::string icon =
-                (stat(ppm.c_str(), &st) == 0) ? ppm : "window";
+                (stat(bmp.c_str(), &st) == 0) ? bmp : "window";
 
             // Encode the window id as a prefix ("id:title"); the generic
             // colon-split below hands us the id back untouched, so
