@@ -484,8 +484,18 @@ static std::vector<Window> getClientListWindows(Display* dpy, const Atoms& atoms
 // renumbered by the WM whenever desktops are inserted/removed, but a
 // window's id and its rough on-screen position don't change just because
 // some other desktop got renamed around it.
+//
+// mon_w/mon_h is that monitor's full size, not the window's. Composing a
+// desktop icon onto a canvas of exactly this size — rather than a canvas
+// sized to fit whatever windows happen to be in the set — means a window
+// that has since been resized by the tiling WM (because a neighbour was
+// moved to another desktop) still renders at its last-known rectangle on
+// a correctly-sized, otherwise-black canvas, instead of on an
+// undersized canvas that silently omits the space its old neighbour used
+// to occupy.
 struct WinMeta {
     int x, y, w, h;
+    int mon_w, mon_h;
 };
 
 // Same, but still in root-window (absolute) coordinates and tagged with the
@@ -592,14 +602,15 @@ static std::string windowMetaPath(Window w) {
     return runDir + "/win-" + std::to_string((unsigned long)w) + ".meta";
 }
 
-static void writeWindowMeta(Window w, int x, int y, int width, int height) {
+static void writeWindowMeta(Window w, int x, int y, int width, int height,
+                             int mon_w, int mon_h) {
     const std::string path = windowMetaPath(w);
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) {
         fprintf(stderr, NAME ": fopen(%s): %s\n", path.c_str(), strerror(errno));
         return;
     }
-    fprintf(fp, "%d %d %d %d\n", x, y, width, height);
+    fprintf(fp, "%d %d %d %d %d %d\n", x, y, width, height, mon_w, mon_h);
     fclose(fp);
 }
 
@@ -607,7 +618,8 @@ static bool readWindowMeta(Window w, WinMeta &out) {
     const std::string path = windowMetaPath(w);
     FILE* fp = fopen(path.c_str(), "r");
     if (!fp) return false;
-    bool ok = fscanf(fp, "%d %d %d %d", &out.x, &out.y, &out.w, &out.h) == 4;
+    bool ok = fscanf(fp, "%d %d %d %d %d %d", &out.x, &out.y, &out.w, &out.h,
+                      &out.mon_w, &out.mon_h) == 6;
     fclose(fp);
     return ok;
 }
@@ -972,9 +984,6 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
     std::vector<Placed> placed;
     placed.reserve(ids.size());
 
-    int canvas_w = 0;
-    int canvas_h = 0;
-
     // First collect valid windows.
     for (Window id : ids) {
         WinMeta m;
@@ -988,12 +997,24 @@ static bool compositeDesktopScreenshot(const std::vector<Window> &ids,
             continue;
 
         placed.push_back({id, m, path});
-
-        canvas_w = std::max(canvas_w, m.x + m.w);
-        canvas_h = std::max(canvas_h, m.y + m.h);
     }
 
-    if (placed.empty() || canvas_w <= 0 || canvas_h <= 0)
+    if (placed.empty())
+        return false;
+
+    // Canvas is the monitor's own size, not the union of the placed
+    // windows' rectangles: a window keeps its last-known rectangle until
+    // its desktop is captured again, so sizing the canvas to fit only the
+    // windows on hand would under-size it the moment a neighbour that
+    // used to share the screen is gone (moved to another desktop, closed,
+    // etc.) — the remaining window would still be drawn at its old,
+    // now-stale-but-plausible-looking half-screen size instead of
+    // reflecting that the tiling WM has since expanded it to fill the
+    // freed space. All windows placed here were captured off the same
+    // monitor screenshot, so any entry's mon_w/mon_h will do.
+    const int canvas_w = placed[0].m.mon_w;
+    const int canvas_h = placed[0].m.mon_h;
+    if (canvas_w <= 0 || canvas_h <= 0)
         return false;
 
     // RGB canvas; background color
@@ -1187,6 +1208,7 @@ struct CropJob {
     std::shared_ptr<ScreenshotRef> screenshot;
     Window win;
     int x, y, w, h;
+    int mon_w, mon_h;  // full size of the monitor this crop came from
 };
 
 static std::mutex              g_cropMutex;
@@ -1228,7 +1250,8 @@ static void cropWorker() {
         if (cropWindowScreenshot(job.screenshot->path, job.x, job.y,
                                    job.w, job.h,
                                    windowScreenshotPath(job.win))) {
-            writeWindowMeta(job.win, job.x, job.y, job.w, job.h);
+            writeWindowMeta(job.win, job.x, job.y, job.w, job.h,
+                             job.mon_w, job.mon_h);
         }
         // job (and its shared_ptr<ScreenshotRef>) is destroyed here; once
         // every job sharing this screenshot has gone through this path,
@@ -1406,7 +1429,8 @@ static bool captureMonitorDesktops(Display *dpy,
             const WinGeom &g = all_wins[wi];
             jobs.push_back({ screenshot, g.id,
                              g.x - monitors[mi].x, g.y - monitors[mi].y,
-                             g.w, g.h });
+                             g.w, g.h,
+                             monitors[mi].w, monitors[mi].h });
         }
         enqueueCropJobs(std::move(jobs));
     }
