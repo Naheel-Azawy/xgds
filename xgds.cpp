@@ -1727,6 +1727,39 @@ static int runScreenshot() {
 
 enum PickerMode { PICK_SWITCH, PICK_MOVE, PICK_WINDOW };
 
+// Escapes every "::" in `inp' as "\::", so gmenu's stdin syntax parser
+// treats it as literal text instead of the special-line marker; see
+// `gmenu --help' (the [text] :: key=value ... syntax). Use this on the
+// leading text/name part of a line.
+static inline std::string gmenu_escape(std::string inp) {
+	std::string out;
+	out.reserve(inp.size());
+	for (std::size_t i = 0; i < inp.size(); ++i) {
+		if (inp[i] == ':' && i + 1 < inp.size() && inp[i + 1] == ':') {
+			out += "\\::";
+			++i; // also consumes the second ':' of this pair
+		} else {
+			out += inp[i];
+		}
+	}
+	return out;
+}
+
+// Escapes `"' and `\' as `\"' and `\\', for embedding `val' inside a
+// double-quoted key="value" in a :: fragment. Use this, not
+// gmenu_escape(), on a value that will be wrapped in quotes -- the
+// fragment parser only understands these two escapes inside a quoted
+// string, not "\::".
+static inline std::string gmenu_escape_value(const std::string &val) {
+	std::string out;
+	out.reserve(val.size());
+	for (char c : val) {
+		if (c == '"' || c == '\\') out += '\\';
+		out += c;
+	}
+	return out;
+}
+
 static int runPicker(PickerMode mode) {
     if (!requireDaemon()) return 1;
 
@@ -1776,8 +1809,8 @@ static int runPicker(PickerMode mode) {
             // Encode the window id as a prefix ("id:title"); the generic
             // colon-split below hands us the id back untouched, so
             // selection never depends on matching title text.
-            oss << ">>j {\"name\":\"" << (unsigned long)win << ": " << title
-                << "\",\"icon\":\"" << icon << "\"}\n";
+            oss << (unsigned long) win << ": " << gmenu_escape(title)
+                << " :: icon=\"" << gmenu_escape_value(icon) << "\"\n";
         }
     } else {
         focused_idx = getCurrentDesktopIndex(dpy, atoms);
@@ -1799,12 +1832,11 @@ static int runPicker(PickerMode mode) {
                     icon = out;
             }
 
-            oss << ">>j {\"name\":\"" << line
-                << "\",\"icon\":\"" << icon << "\"}\n";
+            oss << gmenu_escape(line) << " :: icon=\""
+                << gmenu_escape_value(icon) << "\"\n";
         }
         if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
-            oss << ">>j {\"name\":\"New\","
-                "\"icon\":\"window-new-symbolic\",\"icon-size\":64}\n";
+            oss << "New :: icon=\"window-new-symbolic\" icon-size=64\n";
         }
     }
     std::string items = oss.str();
