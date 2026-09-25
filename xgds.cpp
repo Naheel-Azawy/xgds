@@ -1813,6 +1813,9 @@ static int runPicker(PickerMode mode) {
                 << " :: icon=\"" << gmenu_escape_value(icon) << "\"\n";
         }
     } else {
+        if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
+            oss << "New :: icon=window-new-symbolic where=toolbar\n";
+        }
         focused_idx = getCurrentDesktopIndex(dpy, atoms);
         // Desktop numbers can be renumbered by the WM (e.g. inserting a
         // desktop in the middle shifts every later one), so we never trust
@@ -1834,9 +1837,6 @@ static int runPicker(PickerMode mode) {
 
             oss << gmenu_escape(line) << " :: icon=\""
                 << gmenu_escape_value(icon) << "\"\n";
-        }
-        if (!cmd_change_new.empty() || !cmd_move_new.empty()) {
-            oss << "New :: icon=\"window-new-symbolic\" icon-size=64\n";
         }
     }
     std::string items = oss.str();
